@@ -27,7 +27,8 @@ from typing import List, Dict, AsyncGenerator, Optional
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
+from starlette.background import BackgroundTask
 
 from config import (
     BACKENDS,
@@ -69,6 +70,50 @@ async def shutdown():
 @app.get("/v1/models")
 async def models():
     return {"data": [{"id": MODEL_ID}]}
+
+
+async def proxy_upstream_request(req: Request, path: str) -> Response:
+    clients: List[LlamaClient] = app.state.clients
+    client = clients[0]
+
+    # Host/content-length belong to the incoming hop, not the upstream one.
+    headers = {
+        key: value
+        for key, value in req.headers.items()
+        if key.lower() not in {"host", "content-length"}
+    }
+
+    upstream_path = "/" + path.lstrip("/")
+    if upstream_path == "//":
+        upstream_path = "/"
+
+    upstream_req = client.client.build_request(
+        req.method,
+        upstream_path,
+        params=req.query_params,
+        headers=headers,
+    )
+    resp = await client.client.send(upstream_req, stream=True)
+
+    excluded_headers = {"content-length", "transfer-encoding", "connection"}
+    response_headers = {
+        key: value
+        for key, value in resp.headers.items()
+        if key.lower() not in excluded_headers
+    }
+
+    if req.method.upper() == "HEAD":
+        body = b""
+    else:
+        body = resp.aiter_raw()
+
+    return StreamingResponse(
+        body,
+        status_code=resp.status_code,
+        headers=response_headers,
+        media_type=resp.headers.get("content-type"),
+        background=BackgroundTask(resp.aclose),
+    )
 
 
 async def start_stream_task(
@@ -303,3 +348,13 @@ async def chat(req: Request):
         sm.release(g)
         log.exception("chat_error g=%s key=%s: %s", g, key[:16], e)
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.api_route("/", methods=["GET", "HEAD"])
+async def upstream_root(req: Request):
+    return await proxy_upstream_request(req, "/")
+
+
+@app.api_route("/{path:path}", methods=["GET", "HEAD"])
+async def upstream_passthrough(path: str, req: Request):
+    return await proxy_upstream_request(req, path)
