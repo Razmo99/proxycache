@@ -116,6 +116,9 @@ def find_best_restore_candidate(
             continue
         if int(meta.get("wpb") or 0) != wpb:
             continue
+        key = meta.get("key")
+        if not key or is_restore_poisoned(key):
+            continue
 
         cand_blocks = meta.get("blocks") or []
         lcp = lcp_blocks(req_blocks, cand_blocks)
@@ -124,7 +127,7 @@ def find_best_restore_candidate(
 
         if ratio >= th and ratio > best_ratio:
             best_ratio = ratio
-            best_key = meta.get("key")
+            best_key = key
 
     return (best_key, best_ratio) if best_key else None
 
@@ -173,3 +176,40 @@ def touch_meta(key: str) -> None:
         log.warning("touch_meta_missing key=%s", key[:16])
     except Exception as e:
         log.warning("touch_meta_fail key=%s: %s", key[:16], e)
+
+
+def _poison_path(key: str) -> str:
+    return os.path.join(META_DIR, f"{key}.poison.json")
+
+
+def is_restore_poisoned(key: str) -> bool:
+    return os.path.exists(_poison_path(key))
+
+
+def poison_restore_key(
+    key: str,
+    model_id: str,
+    prompt_n: int,
+    cache_n: int,
+    prompt_ms: float,
+    reason: str = "prompt_reprocess_after_restore",
+) -> None:
+    path = _poison_path(key)
+    payload = {
+        "key": key,
+        "model_id": model_id,
+        "reason": reason,
+        "prompt_n": prompt_n,
+        "cache_n": cache_n,
+        "prompt_ms": prompt_ms,
+        "timestamp": time.time(),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    log.warning(
+        "restore_poisoned key=%s prompt_n=%d cache_n=%d prompt_ms=%.2f",
+        key[:16],
+        prompt_n,
+        cache_n,
+        prompt_ms,
+    )

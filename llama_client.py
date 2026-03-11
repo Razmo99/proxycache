@@ -14,7 +14,7 @@ HTTP-клиент к llama.cpp: /v1/chat/completions (stream/non-stream), /slots
 
 import httpx
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from config import REQUEST_TIMEOUT
 
@@ -30,6 +30,8 @@ class LlamaClient:
             timeout=REQUEST_TIMEOUT,
             limits=limits,
         )
+        self._is_multimodal_cached: Optional[bool] = None
+        self._model_id_cached: Optional[str] = None
         log.info("client_init url=%s httpx_version=%s", base_url, httpx.__version__)
 
     async def close(self):
@@ -149,6 +151,44 @@ class LlamaClient:
 
         return True
 
+    async def get_model_info(self) -> Tuple[str, List[str]]:
+        """
+        Fetch current model id and capabilities from /v1/models.
+
+        Supports both the documented `data` array and the server's `models`
+        array that includes capabilities for multimodal detection.
+        """
+        try:
+            resp = await self.client.get("/v1/models")
+            resp.raise_for_status()
+            payload = resp.json()
+
+            data_models = payload.get("data") or []
+            if data_models and isinstance(data_models[0], dict):
+                mid = data_models[0].get("id") or "unknown"
+            else:
+                mid = "unknown"
+
+            caps: List[str] = []
+            models = payload.get("models") or []
+            if models and isinstance(models[0], dict):
+                caps_raw = models[0].get("capabilities") or []
+                if isinstance(caps_raw, list):
+                    caps = [str(item) for item in caps_raw if item]
+
+            self._model_id_cached = mid
+            self._is_multimodal_cached = "multimodal" in caps
+            log.debug(
+                "get_model_info base_url=%s id=%s capabilities=%s",
+                self.base_url,
+                mid,
+                caps,
+            )
+            return mid, caps
+        except Exception as e:
+            log.warning("get_model_info_fail base_url=%s err=%s", self.base_url, e)
+            return self._model_id_cached or "unknown", []
+
     async def get_model_id(self) -> str:
         """
         Получает id модели у конкретного llama.cpp через /v1/models.
@@ -156,17 +196,48 @@ class LlamaClient:
         Используется только для внутреннего кеширования (ключи файлов/мета),
         наружу прокси продолжает отдавать MODEL_ID из своей конфигурации.
         """
+        mid, _ = await self.get_model_info()
+        return mid
+
+    async def is_multimodal(self) -> bool:
+        """
+        Detect if backend exposes multimodal capability.
+
+        Primary source is /v1/models capabilities. We keep the legacy slot probe
+        as a fallback for older llama.cpp builds that do not report capabilities.
+        """
+        if self._is_multimodal_cached is not None:
+            return self._is_multimodal_cached
+
         try:
-            resp = await self.client.get("/v1/models")
-            resp.raise_for_status()
-            data = resp.json()
-            models = data.get("data") or []
-            if models and isinstance(models[0], dict):
-                mid = models[0].get("id") or "unknown"
+            _, caps = await self.get_model_info()
+            if caps:
+                is_mm = "multimodal" in caps
+                self._is_multimodal_cached = is_mm
+                log.info(
+                    "multimodal_detected_by_capabilities base_url=%s is_mm=%s",
+                    self.base_url,
+                    is_mm,
+                )
+                return is_mm
+
+            resp = await self.client.post(
+                "/slots/0",
+                params={"action": "save"},
+                json={"filename": "test_multimodal_check"},
+            )
+            is_mm = resp.status_code >= 500
+            if is_mm:
+                log.info("multimodal_detected_by_5xx base_url=%s", self.base_url)
             else:
-                mid = "unknown"
-            log.debug("get_model_id base_url=%s id=%s", self.base_url, mid)
-            return mid
+                log.debug(
+                    "multimodal_check_ok base_url=%s status=%d",
+                    self.base_url,
+                    resp.status_code,
+                )
+            self._is_multimodal_cached = is_mm
+            return is_mm
         except Exception as e:
-            log.warning("get_model_id_fail base_url=%s err=%s", self.base_url, e)
-            return "unknown"
+            log.warning("multimodal_check_error base_url=%s err=%s", self.base_url, e)
+            self._is_multimodal_cached = False
+            return False

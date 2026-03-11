@@ -21,6 +21,7 @@ Simple KV Proxy (бронебойный):
 """
 
 import asyncio
+import json
 import time
 import logging
 from typing import List, Dict, AsyncGenerator, Optional
@@ -70,6 +71,31 @@ async def shutdown():
 @app.get("/v1/models")
 async def models():
     return {"data": [{"id": MODEL_ID}]}
+
+
+def _message_has_multimodal_content(message: Dict) -> bool:
+    content = message.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "")
+            if part_type in {
+                "image_url",
+                "input_image",
+                "audio_url",
+                "input_audio",
+                "video_url",
+                "input_video",
+                "file",
+                "input_file",
+            }:
+                return True
+    return False
+
+
+def _request_has_multimodal_workload(messages: List[Dict]) -> bool:
+    return any(_message_has_multimodal_content(msg) for msg in messages or [])
 
 
 async def proxy_upstream_request(req: Request, path: str) -> Response:
@@ -124,15 +150,21 @@ async def start_stream_task(
     blocks: List[str],
     model_id: str,
     sm: SlotManager,
+    restore_key: Optional[str] = None,
+    restored: Optional[bool] = None,
 ) -> AsyncGenerator[bytes, None]:
     queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
 
     async def reader():
+        sse_buffer = b""
+        last_timings: Optional[Dict] = None
         try:
             log.info("stream_reader_start g=%s key=%s", g, key[:16])
             async for chunk in resp.aiter_raw():
                 if not chunk:
                     continue
+                sse_buffer += chunk
+                sse_buffer, last_timings = _consume_sse_timings(sse_buffer, last_timings)
                 try:
                     await queue.put(chunk)
                 except asyncio.CancelledError:
@@ -148,6 +180,7 @@ async def start_stream_task(
                 await resp.aclose()
             except Exception:
                 pass
+            _maybe_poison_restore(restore_key, restored, model_id, last_timings)
             ok = False
             try:
                 ok = await sm.save_after(g, key)
@@ -176,6 +209,124 @@ async def start_stream_task(
     return gen()
 
 
+async def start_stream_task_multimodal(
+    resp: httpx.Response,
+    model_id: str,
+) -> AsyncGenerator[bytes, None]:
+    """
+    Stream task for multimodal backends (no slot management).
+    Just passes through the response without save/restore.
+    """
+    queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
+
+    async def reader():
+        try:
+            log.info("multimodal_stream_reader_start model_id=%s", model_id[:16])
+            async for chunk in resp.aiter_raw():
+                if not chunk:
+                    continue
+                try:
+                    await queue.put(chunk)
+                except asyncio.CancelledError:
+                    log.warning(
+                        "multimodal_stream_reader_cancelled_put model_id=%s",
+                        model_id[:16],
+                    )
+                    raise
+        except asyncio.CancelledError:
+            log.warning("multimodal_stream_reader_cancelled model_id=%s", model_id[:16])
+            raise
+        except Exception as e:
+            log.exception(
+                "multimodal_stream_reader_error model_id=%s: %s", model_id[:16], e
+            )
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            log.info("multimodal_stream_reader_done model_id=%s", model_id[:16])
+            try:
+                await queue.put(None)
+            except Exception:
+                pass
+
+    asyncio.create_task(reader())
+
+    async def gen() -> AsyncGenerator[bytes, None]:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+
+    return gen()
+
+
+def _extract_timings(payload: Optional[Dict]) -> Optional[Dict]:
+    if not isinstance(payload, dict):
+        return None
+    timings = payload.get("timings")
+    return timings if isinstance(timings, dict) else None
+
+
+def _consume_sse_timings(
+    buffer: bytes,
+    last_timings: Optional[Dict],
+) -> tuple[bytes, Optional[Dict]]:
+    while b"\n\n" in buffer:
+        raw_event, buffer = buffer.split(b"\n\n", 1)
+        data_lines = []
+        for line in raw_event.splitlines():
+            if line.startswith(b"data:"):
+                data_lines.append(line[5:].lstrip())
+        if not data_lines:
+            continue
+        data = b"\n".join(data_lines).strip()
+        if not data or data == b"[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except Exception:
+            continue
+        timings = _extract_timings(payload)
+        if timings:
+            last_timings = timings
+    return buffer, last_timings
+
+
+def _maybe_poison_restore(
+    restore_key: Optional[str],
+    restored: Optional[bool],
+    model_id: str,
+    timings: Optional[Dict],
+) -> None:
+    if not restore_key or not restored or not timings:
+        return
+
+    prompt_n = int(timings.get("prompt_n") or 0)
+    cache_n = int(timings.get("cache_n") or 0)
+    prompt_ms = float(timings.get("prompt_ms") or 0.0)
+
+    # A restored cache is considered ineffective if llama.cpp still had to
+    # process at least as many prompt tokens as it reused from cache.
+    if prompt_n > 0 and prompt_n >= cache_n:
+        try:
+            hs.poison_restore_key(
+                restore_key,
+                model_id,
+                prompt_n=prompt_n,
+                cache_n=cache_n,
+                prompt_ms=prompt_ms,
+            )
+        except Exception as e:
+            log.warning(
+                "poison_restore_exception key=%s err=%s",
+                restore_key[:16],
+                e,
+            )
+
+
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
     sm: SlotManager = app.state.sm
@@ -188,8 +339,9 @@ async def chat(req: Request):
     stream = bool(data.get("stream", False))
     client_model = data.get("model") or MODEL_ID
 
-    # model_id берём у первого backend'а
-    backend_model_id = await clients[0].get_model_id()
+    # model_id and capabilities come from the first backend
+    backend_model_id, backend_caps = await clients[0].get_model_info()
+    request_has_media = _request_has_multimodal_workload(messages)
 
     prefix = hs.raw_prefix(messages)
     full_for_key = backend_model_id + "\n" + prefix
@@ -227,6 +379,54 @@ async def chat(req: Request):
         is_big,
         restore_key[:16] if restore_key else None,
     )
+
+    # Detect multimodal-capable backends on first request
+    be_id = 0
+    client = clients[be_id]
+    if not sm.is_multimodal_backend(be_id):
+        is_mm = await client.is_multimodal()
+        if is_mm:
+            await sm.set_multimodal_backend(be_id, True)
+            log.info("multimodal_backend_detected be_id=%d", be_id)
+
+    log.info(
+        "request_modalities be=%d backend_caps=%s request_has_media=%s",
+        be_id,
+        backend_caps,
+        request_has_media,
+    )
+
+    # llama.cpp disables slot save/restore entirely when multimodal support is
+    # enabled for the backend, so the proxy must bypass slot management here.
+    if sm.is_multimodal_backend(be_id):
+        log.info("multimodal_passthrough model_id=%s", backend_model_id)
+        body = dict(data)
+        body["model"] = client_model
+        if stream:
+            resp = await client.chat_completions(body, slot_id=None, stream=True)
+            if resp.status_code != 200:
+                err_txt = await resp.aread()
+                await resp.aclose()
+                return JSONResponse(
+                    {"error": err_txt.decode("utf-8", "ignore")},
+                    status_code=resp.status_code,
+                )
+            gen = await start_stream_task_multimodal(resp, backend_model_id)
+            headers = {
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            }
+            return StreamingResponse(
+                gen, media_type="text/event-stream", headers=headers
+            )
+        else:
+            out = await client.chat_completions(body, slot_id=None, stream=False)
+            if not isinstance(out, dict):
+                return JSONResponse(
+                    {"error": "provider non-JSON body"}, status_code=502
+                )
+            log.info("multimodal_json_done dur_ms=%d", int((time.time() - t0) * 1000))
+            return JSONResponse(content=out, status_code=200)
 
     try:
         g, lock, restored = await asyncio.wait_for(
@@ -295,6 +495,8 @@ async def chat(req: Request):
                 blocks,
                 backend_model_id,
                 sm,
+                restore_key=restore_key if is_big else None,
+                restored=restored,
             )
 
             headers = {
@@ -322,6 +524,12 @@ async def chat(req: Request):
 
             ok = False
             try:
+                _maybe_poison_restore(
+                    restore_key if is_big else None,
+                    restored,
+                    backend_model_id,
+                    _extract_timings(out),
+                )
                 if is_big:
                     ok = await sm.save_after(g, key)
                     hs.write_meta(

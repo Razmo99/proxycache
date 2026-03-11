@@ -13,7 +13,7 @@
 import time
 import asyncio
 import logging
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Any
 
 from config import BACKENDS
 
@@ -24,8 +24,9 @@ GSlot = Tuple[int, int]  # (backend_id, local_slot_id)
 
 class SlotManager:
     def __init__(self):
-        self.backends = []
+        self.backends: List[Dict[str, Any]] = []
         total_slots = 0
+        self._is_multimodal_backends: Dict[int, bool] = {}
 
         for be_id, conf in enumerate(BACKENDS):
             n_slots = int(conf["n_slots"])
@@ -49,9 +50,16 @@ class SlotManager:
             total_slots,
         )
 
-    def set_clients(self, clients: List):
+    def set_clients(self, clients: List[Any]):
         for i, client in enumerate(clients):
             self.backends[i]["client"] = client
+
+    async def set_multimodal_backend(self, be_id: int, is_mm: bool):
+        self._is_multimodal_backends[be_id] = is_mm
+        log.info("multimodal_backend_set be_id=%d is_mm=%s", be_id, is_mm)
+
+    def is_multimodal_backend(self, be_id: int) -> bool:
+        return self._is_multimodal_backends.get(be_id, False)
 
     def _is_free(self, g: GSlot) -> bool:
         return self._last_used.get(g, 0.0) == 0.0
