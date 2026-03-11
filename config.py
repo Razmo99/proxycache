@@ -20,10 +20,12 @@ if BACKENDS_RAW:
     except Exception:
         BACKENDS = []
 else:
-    BACKENDS = [{
-        "url": os.getenv("LLAMA_URL", "http://127.0.0.1:8000"),
-        "n_slots": int(os.getenv("N_SLOTS", "2")),
-    }]
+    BACKENDS = [
+        {
+            "url": os.getenv("LLAMA_URL", "http://127.0.0.1:8000"),
+            "n_slots": int(os.getenv("N_SLOTS", "2")),
+        }
+    ]
 
 # Words per block for LCP
 WORDS_PER_BLOCK = int(os.getenv("WORDS_PER_BLOCK", "100"))
@@ -53,3 +55,7 @@ logging.basicConfig(
     level=LOG_LEVEL.upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+# OpenTelemetry
+OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+OTEL_SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "proxycache")

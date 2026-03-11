@@ -21,6 +21,17 @@ from config import REQUEST_TIMEOUT
 log = logging.getLogger(__name__)
 
 
+def _capabilities_from_model_payload(payload: Dict) -> List[str]:
+    for collection_name in ("models", "data"):
+        models = payload.get(collection_name) or []
+        if not models or not isinstance(models[0], dict):
+            continue
+        caps_raw = models[0].get("capabilities") or []
+        if isinstance(caps_raw, list):
+            return [str(item) for item in caps_raw if item]
+    return []
+
+
 class LlamaClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
@@ -156,7 +167,7 @@ class LlamaClient:
         Fetch current model id and capabilities from /v1/models.
 
         Supports both the documented `data` array and the server's `models`
-        array that includes capabilities for multimodal detection.
+        array for compatibility with different llama.cpp builds.
         """
         try:
             resp = await self.client.get("/v1/models")
@@ -169,12 +180,7 @@ class LlamaClient:
             else:
                 mid = "unknown"
 
-            caps: List[str] = []
-            models = payload.get("models") or []
-            if models and isinstance(models[0], dict):
-                caps_raw = models[0].get("capabilities") or []
-                if isinstance(caps_raw, list):
-                    caps = [str(item) for item in caps_raw if item]
+            caps = _capabilities_from_model_payload(payload)
 
             self._model_id_cached = mid
             self._is_multimodal_cached = "multimodal" in caps
@@ -201,43 +207,18 @@ class LlamaClient:
 
     async def is_multimodal(self) -> bool:
         """
-        Detect if backend exposes multimodal capability.
-
-        Primary source is /v1/models capabilities. We keep the legacy slot probe
-        as a fallback for older llama.cpp builds that do not report capabilities.
+        Detect multimodal capability from /v1/models only.
         """
         if self._is_multimodal_cached is not None:
             return self._is_multimodal_cached
 
-        try:
-            _, caps = await self.get_model_info()
-            if caps:
-                is_mm = "multimodal" in caps
-                self._is_multimodal_cached = is_mm
-                log.info(
-                    "multimodal_detected_by_capabilities base_url=%s is_mm=%s",
-                    self.base_url,
-                    is_mm,
-                )
-                return is_mm
-
-            resp = await self.client.post(
-                "/slots/0",
-                params={"action": "save"},
-                json={"filename": "test_multimodal_check"},
-            )
-            is_mm = resp.status_code >= 500
-            if is_mm:
-                log.info("multimodal_detected_by_5xx base_url=%s", self.base_url)
-            else:
-                log.debug(
-                    "multimodal_check_ok base_url=%s status=%d",
-                    self.base_url,
-                    resp.status_code,
-                )
-            self._is_multimodal_cached = is_mm
-            return is_mm
-        except Exception as e:
-            log.warning("multimodal_check_error base_url=%s err=%s", self.base_url, e)
-            self._is_multimodal_cached = False
-            return False
+        _, caps = await self.get_model_info()
+        is_mm = "multimodal" in caps
+        self._is_multimodal_cached = is_mm
+        log.info(
+            "multimodal_detected_by_models base_url=%s is_mm=%s capabilities=%s",
+            self.base_url,
+            is_mm,
+            caps,
+        )
+        return is_mm

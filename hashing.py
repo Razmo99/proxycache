@@ -29,6 +29,7 @@ from typing import List, Dict, Optional, Tuple
 from config import META_DIR, WORDS_PER_BLOCK
 
 log = logging.getLogger(__name__)
+POISON_SUFFIX = ".poison.json"
 
 
 def raw_prefix(messages: List[Dict]) -> str:
@@ -179,11 +180,66 @@ def touch_meta(key: str) -> None:
 
 
 def _poison_path(key: str) -> str:
-    return os.path.join(META_DIR, f"{key}.poison.json")
+    return os.path.join(META_DIR, f"{key}{POISON_SUFFIX}")
+
+
+def _meta_path(key: str) -> str:
+    return os.path.join(META_DIR, f"{key}.meta.json")
+
+
+def _delete_poison_file(key: str, reason: str) -> None:
+    path = _poison_path(key)
+    try:
+        os.remove(path)
+        log.info("restore_poison_deleted key=%s reason=%s", key[:16], reason)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        log.warning("restore_poison_delete_fail key=%s reason=%s err=%s", key[:16], reason, e)
 
 
 def is_restore_poisoned(key: str) -> bool:
-    return os.path.exists(_poison_path(key))
+    path = _poison_path(key)
+    if not os.path.exists(path):
+        return False
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        log.warning("restore_poison_read_fail key=%s: %s", key[:16], e)
+        _delete_poison_file(key, "unreadable")
+        return False
+
+    if not os.path.exists(_meta_path(key)):
+        _delete_poison_file(key, "orphaned")
+        return False
+
+    prompt_n = int(payload.get("prompt_n") or 0)
+    cache_n = int(payload.get("cache_n") or 0)
+    if prompt_n > 0 and cache_n == 0:
+        return True
+
+    _delete_poison_file(key, "inactive")
+    return False
+
+
+def clear_restore_poison(key: str) -> None:
+    _delete_poison_file(key, "cleared")
+
+
+def cleanup_restore_poisons() -> int:
+    deleted = 0
+    for path in glob.glob(os.path.join(META_DIR, f"*{POISON_SUFFIX}")):
+        name = os.path.basename(path)
+        if not name.endswith(POISON_SUFFIX):
+            continue
+        key = name[: -len(POISON_SUFFIX)]
+        was_poisoned = os.path.exists(path)
+        still_poisoned = is_restore_poisoned(key)
+        if was_poisoned and not still_poisoned:
+            deleted += 1
+    return deleted
 
 
 def poison_restore_key(
@@ -192,7 +248,7 @@ def poison_restore_key(
     prompt_n: int,
     cache_n: int,
     prompt_ms: float,
-    reason: str = "prompt_reprocess_after_restore",
+    reason: str = "no_cache_reuse_after_restore",
 ) -> None:
     path = _poison_path(key)
     payload = {

@@ -6,7 +6,7 @@ This is a Python-based proxy service for llama.cpp that manages KV cache slots, 
 
 ### Multimodal Support
 
-The proxy automatically detects multimodal models (like LLaVA, Qwen-VL, Gemini) by attempting a slot save operation. If the model returns a 5XX error (indicating it doesn't support slots), the proxy switches to passthrough mode for that backend, skipping all slot management operations. This detection happens on the first request and is cached for subsequent requests.
+The proxy detects multimodal models (like LLaVA, Qwen-VL, Gemini) from the backend `/v1/models` response by checking model capabilities. When a backend reports `multimodal`, the proxy switches that backend to passthrough mode and skips slot save/restore for subsequent requests.
 
 ## Build & Run Commands
 

@@ -25,6 +25,7 @@ import json
 import time
 import logging
 from typing import List, Dict, AsyncGenerator, Optional
+from opentelemetry import trace
 
 import httpx
 from fastapi import FastAPI, Request
@@ -58,6 +59,13 @@ async def startup():
     sm.set_clients(clients)
     app.state.clients = clients
     app.state.sm = sm
+    deleted_poison_files = hs.cleanup_restore_poisons()
+
+    from otel import init_otel
+
+    init_otel(app, clients[0].client if clients else None)
+    if deleted_poison_files:
+        log.info("startup_deleted_restore_poisons n=%d", deleted_poison_files)
     log.info("app_start n_backends=%d port=%d", len(BACKENDS), PORT)
 
 
@@ -164,7 +172,9 @@ async def start_stream_task(
                 if not chunk:
                     continue
                 sse_buffer += chunk
-                sse_buffer, last_timings = _consume_sse_timings(sse_buffer, last_timings)
+                sse_buffer, last_timings = _consume_sse_timings(
+                    sse_buffer, last_timings
+                )
                 try:
                     await queue.put(chunk)
                 except asyncio.CancelledError:
@@ -186,6 +196,8 @@ async def start_stream_task(
                 ok = await sm.save_after(g, key)
             except Exception as e:
                 log.warning("save_after_exception g=%s key=%s: %s", g, key[:16], e)
+            if ok:
+                hs.clear_restore_poison(key)
             try:
                 hs.write_meta(key, prefix, blocks, WORDS_PER_BLOCK, model_id)
             except Exception as e:
@@ -308,9 +320,10 @@ def _maybe_poison_restore(
     cache_n = int(timings.get("cache_n") or 0)
     prompt_ms = float(timings.get("prompt_ms") or 0.0)
 
-    # A restored cache is considered ineffective if llama.cpp still had to
-    # process at least as many prompt tokens as it reused from cache.
-    if prompt_n > 0 and prompt_n >= cache_n:
+    # Only poison when restore claimed success but llama.cpp reused none of the
+    # prompt tokens. Short incremental restores can legitimately have prompt_n
+    # close to cache_n, so keep this check intentionally conservative.
+    if prompt_n > 0 and cache_n == 0:
         try:
             hs.poison_restore_key(
                 restore_key,
@@ -318,6 +331,7 @@ def _maybe_poison_restore(
                 prompt_n=prompt_n,
                 cache_n=cache_n,
                 prompt_ms=prompt_ms,
+                reason="no_cache_reuse_after_restore",
             )
         except Exception as e:
             log.warning(
@@ -339,8 +353,12 @@ async def chat(req: Request):
     stream = bool(data.get("stream", False))
     client_model = data.get("model") or MODEL_ID
 
-    # model_id and capabilities come from the first backend
-    backend_model_id, backend_caps = await clients[0].get_model_info()
+    be_id = 0
+    client = clients[be_id]
+
+    # model identity and multimodal capability come from /v1/models.
+    backend_model_id, backend_caps = await client.get_model_info()
+    backend_is_multimodal = await client.is_multimodal()
     request_has_media = _request_has_multimodal_workload(messages)
 
     prefix = hs.raw_prefix(messages)
@@ -380,14 +398,13 @@ async def chat(req: Request):
         restore_key[:16] if restore_key else None,
     )
 
-    # Detect multimodal-capable backends on first request
-    be_id = 0
-    client = clients[be_id]
-    if not sm.is_multimodal_backend(be_id):
-        is_mm = await client.is_multimodal()
-        if is_mm:
-            await sm.set_multimodal_backend(be_id, True)
-            log.info("multimodal_backend_detected be_id=%d", be_id)
+    if backend_is_multimodal != sm.is_multimodal_backend(be_id):
+        await sm.set_multimodal_backend(be_id, backend_is_multimodal)
+        log.info(
+            "multimodal_backend_detected be_id=%d via=models is_mm=%s",
+            be_id,
+            backend_is_multimodal,
+        )
 
     log.info(
         "request_modalities be=%d backend_caps=%s request_has_media=%s",
@@ -398,7 +415,7 @@ async def chat(req: Request):
 
     # llama.cpp disables slot save/restore entirely when multimodal support is
     # enabled for the backend, so the proxy must bypass slot management here.
-    if sm.is_multimodal_backend(be_id):
+    if backend_is_multimodal:
         log.info("multimodal_passthrough model_id=%s", backend_model_id)
         body = dict(data)
         body["model"] = client_model
@@ -448,6 +465,15 @@ async def chat(req: Request):
 
     be_id, slot_id = g
     client = clients[be_id]
+
+    tracer = trace.get_tracer(__name__)
+    current_span = trace.get_current_span()
+    current_span.set_attribute("cache.hit", restored)
+    current_span.set_attribute("cache.key", key[:32] if key else "")
+    current_span.set_attribute("slot.id", slot_id)
+    n_used = sum(1 for lock in sm._locks.values() if lock.locked())
+    current_span.set_attribute("slot.n_used", n_used)
+    current_span.set_attribute("llm.model", backend_model_id)
 
     body = dict(data)
     body["model"] = client_model
@@ -532,6 +558,8 @@ async def chat(req: Request):
                 )
                 if is_big:
                     ok = await sm.save_after(g, key)
+                    if ok:
+                        hs.clear_restore_poison(key)
                     hs.write_meta(
                         key,
                         prefix,
