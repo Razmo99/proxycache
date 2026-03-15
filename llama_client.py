@@ -43,6 +43,8 @@ class LlamaClient:
         )
         self._is_multimodal_cached: Optional[bool] = None
         self._model_id_cached: Optional[str] = None
+        self._capabilities_cached: Optional[List[str]] = None
+        self._slots_supported_cached: Optional[bool] = None
         log.info("client_init url=%s httpx_version=%s", base_url, httpx.__version__)
 
     async def close(self):
@@ -133,6 +135,10 @@ class LlamaClient:
             json={"filename": basename},
         )
 
+        if resp.status_code in {404, 405, 501}:
+            self.mark_slots_unsupported("save_not_supported", resp.status_code)
+            return False
+
         if resp.status_code == 500:
             log.warning(
                 "save_slot_500 slot=%d basename=%s",
@@ -150,6 +156,10 @@ class LlamaClient:
             params={"action": "restore"},
             json={"filename": basename},
         )
+
+        if resp.status_code in {404, 405, 501}:
+            self.mark_slots_unsupported("restore_not_supported", resp.status_code)
+            return False
 
         if resp.status_code != 200:
             log.warning(
@@ -169,6 +179,9 @@ class LlamaClient:
         Supports both the documented `data` array and the server's `models`
         array for compatibility with different llama.cpp builds.
         """
+        if self._model_id_cached is not None and self._capabilities_cached is not None:
+            return self._model_id_cached, list(self._capabilities_cached)
+
         try:
             resp = await self.client.get("/v1/models")
             resp.raise_for_status()
@@ -183,6 +196,7 @@ class LlamaClient:
             caps = _capabilities_from_model_payload(payload)
 
             self._model_id_cached = mid
+            self._capabilities_cached = caps
             self._is_multimodal_cached = "multimodal" in caps
             log.debug(
                 "get_model_info base_url=%s id=%s capabilities=%s",
@@ -193,7 +207,7 @@ class LlamaClient:
             return mid, caps
         except Exception as e:
             log.warning("get_model_info_fail base_url=%s err=%s", self.base_url, e)
-            return self._model_id_cached or "unknown", []
+            return self._model_id_cached or "unknown", list(self._capabilities_cached or [])
 
     async def get_model_id(self) -> str:
         """
@@ -222,3 +236,22 @@ class LlamaClient:
             caps,
         )
         return is_mm
+
+    def slots_supported(self) -> bool:
+        return self._slots_supported_cached is not False
+
+    def mark_slots_unsupported(
+        self,
+        reason: str,
+        status_code: Optional[int] = None,
+    ) -> None:
+        if self._slots_supported_cached is False:
+            return
+
+        self._slots_supported_cached = False
+        log.warning(
+            "slots_unsupported_detected base_url=%s reason=%s status_code=%s",
+            self.base_url,
+            reason,
+            status_code,
+        )

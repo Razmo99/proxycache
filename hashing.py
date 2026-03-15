@@ -26,7 +26,7 @@ import glob
 import logging
 from typing import List, Dict, Optional, Tuple
 
-from config import META_DIR, WORDS_PER_BLOCK
+from config import MAX_SAVED_CACHES, META_DIR, SLOT_SAVE_PATH, WORDS_PER_BLOCK
 
 log = logging.getLogger(__name__)
 POISON_SUFFIX = ".poison.json"
@@ -77,9 +77,9 @@ def prefix_key_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def scan_all_meta() -> List[Dict]:
+def scan_all_meta(meta_dir: str = META_DIR) -> List[Dict]:
     files = sorted(
-        glob.glob(os.path.join(META_DIR, "*.meta.json")),
+        glob.glob(os.path.join(meta_dir, "*.meta.json")),
         key=os.path.getmtime,
         reverse=True,
     )
@@ -187,6 +187,14 @@ def _meta_path(key: str) -> str:
     return os.path.join(META_DIR, f"{key}.meta.json")
 
 
+def _meta_path_in_dir(key: str, meta_dir: str) -> str:
+    return os.path.join(meta_dir, f"{key}.meta.json")
+
+
+def _poison_path_in_dir(key: str, meta_dir: str) -> str:
+    return os.path.join(meta_dir, f"{key}{POISON_SUFFIX}")
+
+
 def _delete_poison_file(key: str, reason: str) -> None:
     path = _poison_path(key)
     try:
@@ -226,6 +234,67 @@ def is_restore_poisoned(key: str) -> bool:
 
 def clear_restore_poison(key: str) -> None:
     _delete_poison_file(key, "cleared")
+
+
+def prune_saved_caches(
+    model_id: str,
+    keep: int = MAX_SAVED_CACHES,
+    meta_dir: str = META_DIR,
+    cache_dir: str = SLOT_SAVE_PATH,
+) -> int:
+    """
+    Keep only the newest saved caches for this proxy instance/model.
+
+    Retention is driven by the local meta directory, while actual KV blobs live
+    under cache_dir and are addressed by basename == meta["key"].
+    """
+    if keep < 0:
+        keep = 0
+
+    metas = []
+    for meta in scan_all_meta(meta_dir):
+        if meta.get("model_id") != model_id:
+            continue
+        key = meta.get("key")
+        if not key:
+            continue
+        metas.append(meta)
+
+    log.info(
+        "retention_scan model_id=%s meta_dir=%s cache_dir=%s keep=%d found=%d",
+        model_id,
+        meta_dir,
+        cache_dir,
+        keep,
+        len(metas),
+    )
+
+    deleted = 0
+    for meta in metas[keep:]:
+        key = str(meta["key"])
+
+        blob_path = os.path.join(cache_dir, key)
+        for path in (
+            blob_path,
+            _meta_path_in_dir(key, meta_dir),
+            _poison_path_in_dir(key, meta_dir),
+        ):
+            try:
+                os.remove(path)
+                deleted += 1
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                log.warning("retention_delete_fail key=%s path=%s err=%s", key[:16], path, e)
+
+        log.info(
+            "retention_pruned key=%s model_id=%s cache_dir=%s",
+            key[:16],
+            model_id,
+            cache_dir,
+        )
+
+    return deleted
 
 
 def cleanup_restore_poisons() -> int:

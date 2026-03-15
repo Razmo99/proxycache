@@ -6,6 +6,7 @@
 - BACKENDS: [{"url": "...", "n_slots": N}]
 - WORDS_PER_BLOCK, BIG_THRESHOLD_WORDS, LCP_TH
 - PORT, REQUEST_TIMEOUT, MODEL_ID
+- MAX_SAVED_CACHES, SLOT_SAVE_PATH
 """
 
 import os
@@ -27,6 +28,23 @@ else:
         }
     ]
 
+
+def _default_max_saved_caches() -> int:
+    env_value = os.getenv("N_SLOTS")
+    if env_value:
+        try:
+            return max(0, int(env_value))
+        except Exception:
+            pass
+
+    if BACKENDS:
+        try:
+            return max(0, int(BACKENDS[0].get("n_slots", 0)))
+        except Exception:
+            pass
+
+    return 0
+
 # Words per block for LCP
 WORDS_PER_BLOCK = int(os.getenv("WORDS_PER_BLOCK", "100"))
 
@@ -39,6 +57,17 @@ LCP_TH = float(os.getenv("LCP_TH", "0.6"))
 # Meta dir
 META_DIR = os.path.join(os.getcwd(), os.getenv("META_DIR", "kv_meta"))
 os.makedirs(META_DIR, exist_ok=True)
+
+# Save/restore retention
+MAX_SAVED_CACHES = int(
+    os.getenv("MAX_SAVED_CACHES", str(_default_max_saved_caches()))
+)
+SLOT_SAVE_PATH = os.getenv(
+    "SLOT_SAVE_PATH",
+    os.path.dirname(os.path.dirname(META_DIR))
+    if os.path.basename(META_DIR.rstrip(os.sep)) == "meta"
+    else os.path.dirname(META_DIR),
+)
 
 # HTTP timeout
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "600"))
@@ -55,7 +84,3 @@ logging.basicConfig(
     level=LOG_LEVEL.upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-
-# OpenTelemetry
-OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-OTEL_SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "proxycache")
