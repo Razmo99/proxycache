@@ -1,6 +1,6 @@
 [project]
 name = "proxycache"
-version = "0.1.0"
+version = "1.0.1"
 description = "KV cache proxy for llama.cpp"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0.2",
+    "pytest-cov>=6.2.1",
     "pytest-asyncio>=1.3.0",
     "ruff>=0.12.0",
     "bandit>=1.8.6",
@@ -41,9 +42,28 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.pytest.ini_options]
-addopts = ["--import-mode=importlib"]
+addopts = [
+    "--import-mode=importlib",
+    "--cov=proxycache",
+    "--cov-report=term-missing:skip-covered",
+]
 pythonpath = ["src"]
 testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "unit: fast, isolated tests for pure logic and small service units",
+    "integration: in-process app and service boundary tests",
+    "smoke: minimal high-signal end-to-end checks",
+]
+
+[tool.coverage.run]
+source = ["proxycache"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = true
 
 [tool.ruff]
 line-length = 88

@@ -11,7 +11,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -152,7 +152,7 @@ class CacheStore:
             timestamp=time.time(),
         )
         with self._meta_path(key).open("w", encoding="utf-8") as handle:
-            json.dump(payload.__dict__, handle, indent=2, ensure_ascii=False)
+            json.dump(asdict(payload), handle, indent=2, ensure_ascii=False)
 
     def touch_meta(self, key: str) -> None:
         path = self._meta_path(key)
