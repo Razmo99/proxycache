@@ -259,3 +259,87 @@ async def test_handle_json_slot_request_releases_slot_and_ends_span_on_exception
 
     assert released == [(0, 1)]
     assert span.ended is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_handle_json_slot_request_returns_upstream_status_and_poisons_failed_restored_candidate(
+    make_settings,
+    cache_store,
+) -> None:
+    settings = make_settings(name="json-slot-upstream-restore-fail")
+    service = ProxyService(settings, [], SimpleNamespace(), cache_store)
+    released: list[tuple[int, int]] = []
+    service.lifecycle.release_slot = lambda slot, span=None: released.append(slot)
+    cache_store.write_meta("restore-key", "one two three four", ["a"], 2, "model-a")
+    request = httpx.Request("POST", "http://backend.test/v1/chat/completions")
+    response = httpx.Response(400, request=request, text="ctx mismatch")
+    client = SimpleNamespace(
+        chat_completions=AsyncMock(
+            side_effect=httpx.HTTPStatusError("bad request", request=request, response=response)
+        )
+    )
+    span = SpanStub()
+
+    result = await service._handle_json_slot_request(
+        client=client,
+        body={"messages": []},
+        slot=(0, 1),
+        key="cache-key",
+        prefix="one two three four",
+        blocks=["a"],
+        backend_model_id="model-a",
+        restore_key="restore-key",
+        restored=True,
+        is_big=True,
+        current_span=span,
+        started_at=time.time(),
+    )
+
+    assert result.status_code == 400
+    assert result.body == b'{"error":"ctx mismatch"}'
+    assert cache_store.is_restore_poisoned("restore-key") is True
+    assert released == [(0, 1)]
+    assert span.ended is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_handle_json_slot_request_does_not_poison_candidate_when_restore_never_succeeded(
+    make_settings,
+    cache_store,
+) -> None:
+    settings = make_settings(name="json-slot-upstream-no-restore-poison")
+    service = ProxyService(settings, [], SimpleNamespace(), cache_store)
+    released: list[tuple[int, int]] = []
+    service.lifecycle.release_slot = lambda slot, span=None: released.append(slot)
+    cache_store.write_meta("restore-key", "one two three four", ["a"], 2, "model-a")
+    request = httpx.Request("POST", "http://backend.test/v1/chat/completions")
+    response = httpx.Response(400, request=request, text="prompt too long")
+    client = SimpleNamespace(
+        chat_completions=AsyncMock(
+            side_effect=httpx.HTTPStatusError("bad request", request=request, response=response)
+        )
+    )
+    span = SpanStub()
+
+    result = await service._handle_json_slot_request(
+        client=client,
+        body={"messages": []},
+        slot=(0, 1),
+        key="cache-key",
+        prefix="one two three four",
+        blocks=["a"],
+        backend_model_id="model-a",
+        restore_key="restore-key",
+        restored=False,
+        is_big=True,
+        current_span=span,
+        started_at=time.time(),
+    )
+
+    assert result.status_code == 400
+    assert result.body == b'{"error":"prompt too long"}'
+    assert cache_store.is_restore_poisoned("restore-key") is False
+    assert released == [(0, 1)]
+    assert span.ended is True

@@ -427,7 +427,27 @@ class ProxyService:
     ) -> Response:
         saved = False
         try:
-            output = await client.chat_completions(body, slot_id=slot[1], stream=False)
+            try:
+                output = await client.chat_completions(body, slot_id=slot[1], stream=False)
+            except httpx.HTTPStatusError as exc:
+                self._poison_failed_restored_candidate(
+                    restore_key=restore_key,
+                    restored=restored,
+                    backend_model_id=backend_model_id,
+                    prefix=prefix,
+                    current_span=current_span,
+                )
+                upstream_response = exc.response
+                error_text = upstream_response.text or exc.request.url.path
+                set_error(
+                    current_span,
+                    f"upstream_http_{upstream_response.status_code}",
+                    "upstream returned non-200 status",
+                )
+                return JSONResponse(
+                    {"error": error_text},
+                    status_code=upstream_response.status_code,
+                )
             if not isinstance(output, dict):
                 set_error(current_span, "provider_non_json_body", "provider returned non-JSON body")
                 return JSONResponse({"error": "provider non-JSON body"}, status_code=502)
@@ -474,3 +494,36 @@ class ProxyService:
         finally:
             self.lifecycle.release_slot(slot, current_span)
             current_span.end()
+
+    def _poison_failed_restored_candidate(
+        self,
+        *,
+        restore_key: str | None,
+        restored: bool | None,
+        backend_model_id: str,
+        prefix: str,
+        current_span,
+    ) -> None:
+        if not restore_key or restored is not True:
+            return
+        prompt_n = max(1, len(self.cache_store.words_from_text(prefix)))
+        try:
+            self.cache_store.poison_restore_key(
+                restore_key,
+                backend_model_id,
+                prompt_n=prompt_n,
+                cache_n=0,
+                prompt_ms=0.0,
+                reason="chat_failed_after_restore",
+            )
+            add_lifecycle_event(
+                current_span,
+                "proxycache.cache.restore.poisoned",
+                cache_key_prefix=restore_key[:16],
+                model_id=backend_model_id,
+                prompt_tokens=prompt_n,
+                cache_read_tokens=0,
+                reason="chat_failed_after_restore",
+            )
+        except Exception as poison_exc:
+            log.warning("poison_failed_restore_exception key=%s err=%s", restore_key[:16], poison_exc)

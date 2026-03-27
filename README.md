@@ -112,6 +112,80 @@ Valid examples:
 
 See [contributing.md](/home/razmo/project/proxycache/docs/contributing.md) for the accepted commit types and examples.
 
+### Real-model smoke test
+
+There is an opt-in live smoke test that uses Docker containers to launch a custom `llama-swap` backend image plus a local build of the proxy, then verifies that proxy-managed cache restore is measurably effective.
+
+It is disabled by default and does not run in CI.
+
+Required environment:
+
+```bash
+export REAL_SMOKE=1
+export REAL_SMOKE_MODEL_PRESETS=qwen_0_5b_instruct
+```
+
+The backend image bakes in these small GGUF presets:
+
+- `qwen_0_5b_instruct`
+- `qwen_coder_0_5b_instruct`
+
+To run both:
+
+```bash
+export REAL_SMOKE=1
+export REAL_SMOKE_MODEL_PRESETS=all
+```
+
+Optional environment:
+
+```bash
+export REAL_SMOKE_BACKEND_IMAGE=proxycache-real-smoke-backend:local
+export REAL_SMOKE_MODEL_ID=qwen_0_5b_instruct
+export REAL_SMOKE_PRIMARY_PRESET=qwen_0_5b_instruct
+export REAL_SMOKE_PREFIX_REPEAT=96
+export REAL_SMOKE_MAX_PROMPT_MS_RATIO=0.9
+export REAL_SMOKE_MIN_CACHE_N=1
+export REAL_SMOKE_LONG_CTX_SIZE=12288
+export REAL_SMOKE_LONG_TARGET_TOKENS=6000
+```
+
+Run it with:
+
+```bash
+pytest -q --no-cov -m real_smoke tests/real_smoke/test_live_proxy_cache.py
+```
+
+What it does:
+
+- builds a custom `llama-swap` image with both small Qwen GGUF files baked into `/models`
+- starts the backend via a small wrapper so llama.cpp args like `--swa-full` and larger `--ctx-size` can be varied per smoke test without rebuilding the image
+- starts that backend container and routes the selected preset through `/upstream/<model>`
+- builds the local proxy Docker image and runs it in a second container
+- runs a base save/evict/restore smoke on both baked-in Qwen presets
+- runs a system-prompt toggle scenario that simulates enabling an MCP and checks that the changed system prompt invalidates reuse while the original prompt restores again later
+- runs the same restore scenario with and without llama.cpp `--swa-full`
+- runs a long-context scenario that asserts restore still works on a prompt of at least 6k tokens
+
+There is also an OpenCode-specific real smoke in [test_opencode_sdk_smoke.py](/home/razmo/project/proxycache/tests/real_smoke/test_opencode_sdk_smoke.py). It uses the Node OpenCode SDK to manage session history and revert/undo behavior, then measures cache reuse by replaying the SDK session’s user messages through the proxy. Run it with:
+
+```bash
+REAL_SMOKE=1 pytest -q --no-cov -m real_smoke tests/real_smoke/test_opencode_sdk_smoke.py
+```
+
+That OpenCode smoke now includes:
+
+- a basic revert/undo cache-reuse flow
+- a fixed-default 64K backend scenario that loads a large OpenCode-style workspace prompt, sends `Hi`, sends `Goodbye`, reverts the second turn, and checks that the reverted branch restores efficiently
+- a 64K branch-thrash scenario that repeatedly reverts and forks new turns to check that restore candidates stay valid without poisoning or stale-branch corruption
+
+The container smoke in [test_live_proxy_cache.py](/home/razmo/project/proxycache/tests/real_smoke/test_live_proxy_cache.py) also includes adversarial cases such as:
+
+- a near-match early system-prompt change intended to catch false-positive restores
+- a matcher stress matrix covering early prefix mutations, message-shape changes, reordered history, and many-similar-candidate ranking
+- concurrent identical long-prefix requests against a single-slot backend to catch deadlocks and bad slot-state cleanup
+- corrupted saved-cache and backend-ctx-mismatch scenarios that probe how the proxy behaves when llama.cpp is unhappy with a restore
+
 ### Why this boosts IDE and long‑context productivity
 
 For 30–60k‑token contexts typical in project‑wide IDE assistants, recomputing a full prompt can take minutes, whereas restoring a previously cached context and continuing from the first mismatching token typically takes seconds on llama.cpp, dramatically improving iteration speed for large teams with limited slots.

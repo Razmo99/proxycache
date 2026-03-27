@@ -107,6 +107,81 @@ async def test_slot_acquire_timeout_returns_503(async_test_client, messages_fact
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_failed_chat_after_successful_restore_returns_upstream_400_and_poison_skips_future_retries(
+    async_test_client,
+    mock_backend,
+    messages_factory,
+) -> None:
+    service = async_test_client.proxycache_app.state.service
+    prefix = service.cache_store.raw_prefix(messages_factory("big"))
+    blocks = service.cache_store.block_hashes_from_text(prefix, service.settings.words_per_block)
+    restore_key = "restore-key"
+    service.cache_store.write_meta(
+        restore_key,
+        prefix,
+        blocks,
+        service.settings.words_per_block,
+        "llama.cpp",
+    )
+    mock_backend.chat_status_code = 400
+
+    first_response = await async_test_client.post(
+        "/v1/chat/completions",
+        json={"model": "llama.cpp", "messages": messages_factory("big"), "stream": False},
+    )
+
+    assert first_response.status_code == 400
+    assert service.cache_store.is_restore_poisoned(restore_key) is True
+    restore_requests_after_first = [
+        request for request in mock_backend.requests if request.url.path == "/slots/0" and request.url.params.get("action") == "restore"
+    ]
+    assert len(restore_requests_after_first) == 1
+
+    mock_backend.chat_status_code = 200
+    second_response = await async_test_client.post(
+        "/v1/chat/completions",
+        json={"model": "llama.cpp", "messages": messages_factory("big"), "stream": False},
+    )
+
+    assert second_response.status_code == 200
+    restore_requests_total = [
+        request for request in mock_backend.requests if request.url.path == "/slots/0" and request.url.params.get("action") == "restore"
+    ]
+    assert len(restore_requests_total) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_failed_chat_after_failed_restore_does_not_poison_candidate(
+    async_test_client,
+    mock_backend,
+    messages_factory,
+) -> None:
+    service = async_test_client.proxycache_app.state.service
+    prefix = service.cache_store.raw_prefix(messages_factory("big"))
+    blocks = service.cache_store.block_hashes_from_text(prefix, service.settings.words_per_block)
+    restore_key = "restore-key"
+    service.cache_store.write_meta(
+        restore_key,
+        prefix,
+        blocks,
+        service.settings.words_per_block,
+        "llama.cpp",
+    )
+    mock_backend.slot_restore_status_code = 400
+    mock_backend.chat_status_code = 400
+
+    response = await async_test_client.post(
+        "/v1/chat/completions",
+        json={"model": "llama.cpp", "messages": messages_factory("big"), "stream": False},
+    )
+
+    assert response.status_code == 400
+    assert service.cache_store.is_restore_poisoned(restore_key) is False
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_streaming_request_forwards_sse_and_releases_slot(async_test_client, mock_backend, messages_factory) -> None:
     mock_backend.stream_chunks = [
         b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n',
