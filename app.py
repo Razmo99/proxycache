@@ -25,6 +25,7 @@ import json
 import time
 import re
 import logging
+from contextlib import nullcontext, suppress
 from typing import List, Dict, AsyncGenerator, Optional
 from opentelemetry import trace
 
@@ -46,6 +47,18 @@ from config import (
 )
 import hashing as hs
 from llama_client import LlamaClient
+from otel import (
+    add_cache_attributes,
+    add_input_attributes,
+    add_llm_attributes,
+    add_lifecycle_event,
+    add_response_attributes,
+    add_timing_attributes,
+    init_otel,
+    set_error,
+    shutdown_otel,
+    start_inference_span,
+)
 from slot_manager import SlotManager, GSlot
 
 log = logging.getLogger(__name__)
@@ -77,7 +90,6 @@ async def startup():
     app.state.sm = sm
     deleted_poison_files = hs.cleanup_restore_poisons()
 
-    from otel import init_otel
     from version import __version__
 
     init_otel(app, clients[0].client if clients else None)
@@ -99,6 +111,7 @@ async def shutdown():
     clients: List[LlamaClient] = getattr(app.state, "clients", [])
     if clients:
         await asyncio.gather(*(c.close() for c in clients))
+    shutdown_otel()
 
 
 @app.get("/v1/models")
@@ -187,6 +200,106 @@ def _record_saved_cache(
         )
 
 
+async def _save_cache_artifacts(
+    sm: SlotManager,
+    g: GSlot,
+    key: str,
+    prefix: str,
+    blocks: List[str],
+    model_id: str,
+    span=None,
+) -> bool:
+    add_lifecycle_event(
+        span,
+        "proxycache.cache.save.started",
+        backend_id=g[0],
+        slot_id=g[1],
+        cache_key_prefix=key[:16],
+        model_id=model_id,
+    )
+
+    try:
+        saved = await sm.save_after(g, key)
+    except Exception as e:
+        set_error(span, e.__class__.__name__, str(e))
+        add_lifecycle_event(
+            span,
+            "proxycache.cache.save.failed",
+            backend_id=g[0],
+            slot_id=g[1],
+            cache_key_prefix=key[:16],
+            error_type=e.__class__.__name__,
+        )
+        log.warning("save_after_exception g=%s key=%s: %s", g, key[:16], e)
+        return False
+
+    add_lifecycle_event(
+        span,
+        "proxycache.cache.save.completed",
+        backend_id=g[0],
+        slot_id=g[1],
+        cache_key_prefix=key[:16],
+        saved=saved,
+    )
+
+    if not saved:
+        return False
+
+    hs.clear_restore_poison(key)
+    try:
+        _record_saved_cache(key, prefix, blocks, model_id)
+        add_lifecycle_event(
+            span,
+            "proxycache.cache.metadata.recorded",
+            cache_key_prefix=key[:16],
+            model_id=model_id,
+        )
+    except Exception as e:
+        set_error(span, e.__class__.__name__, str(e))
+        add_lifecycle_event(
+            span,
+            "proxycache.cache.metadata.record.failed",
+            cache_key_prefix=key[:16],
+            model_id=model_id,
+            error_type=e.__class__.__name__,
+        )
+        log.warning("record_saved_cache_exception key=%s: %s", key[:16], e)
+
+    return True
+
+
+def _release_slot(sm: SlotManager, g: GSlot, span=None) -> None:
+    sm.release(g)
+    add_lifecycle_event(
+        span,
+        "proxycache.slot.released",
+        backend_id=g[0],
+        slot_id=g[1],
+    )
+
+
+def _record_restore_outcome(
+    span,
+    g: GSlot,
+    restore_key: Optional[str],
+    restored: Optional[bool],
+) -> None:
+    if not restore_key:
+        return
+
+    add_lifecycle_event(
+        span,
+        (
+            "proxycache.cache.restore.completed"
+            if restored
+            else "proxycache.cache.restore.failed"
+        ),
+        backend_id=g[0],
+        slot_id=g[1],
+        cache_key_prefix=restore_key[:16],
+    )
+
+
 async def proxy_upstream_request(req: Request, path: str) -> Response:
     clients: List[LlamaClient] = app.state.clients
     client = clients[0]
@@ -239,56 +352,88 @@ async def start_stream_task(
     blocks: List[str],
     model_id: str,
     sm: SlotManager,
+    span=None,
     restore_key: Optional[str] = None,
     restored: Optional[bool] = None,
+    persist_cache: bool = False,
 ) -> AsyncGenerator[bytes, None]:
     queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
 
     async def reader():
-        sse_buffer = b""
-        last_timings: Optional[Dict] = None
-        try:
-            log.info("stream_reader_start g=%s key=%s", g, key[:16])
-            async for chunk in resp.aiter_raw():
-                if not chunk:
-                    continue
-                sse_buffer += chunk
-                sse_buffer, last_timings = _consume_sse_timings(
-                    sse_buffer, last_timings
+        with _span_scope(span):
+            sse_buffer = b""
+            last_timings: Optional[Dict] = None
+            saved = False
+            try:
+                log.info("stream_reader_start g=%s key=%s", g, key[:16])
+                add_lifecycle_event(
+                    span,
+                    "proxycache.stream.started",
+                    backend_id=g[0],
+                    slot_id=g[1],
+                    cache_key_prefix=key[:16],
                 )
-                try:
-                    await queue.put(chunk)
-                except asyncio.CancelledError:
-                    log.warning("stream_reader_cancelled_put g=%s key=%s", g, key[:16])
-                    raise
-        except asyncio.CancelledError:
-            log.warning("stream_reader_cancelled g=%s key=%s", g, key[:16])
-            raise
-        except Exception as e:
-            log.exception("stream_reader_error g=%s key=%s: %s", g, key[:16], e)
-        finally:
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
-            _maybe_poison_restore(restore_key, restored, model_id, last_timings)
-            ok = False
-            try:
-                ok = await sm.save_after(g, key)
+                async for chunk in resp.aiter_raw():
+                    if not chunk:
+                        continue
+                    sse_buffer += chunk
+                    sse_buffer, last_timings = _consume_sse_timings(
+                        sse_buffer, last_timings
+                    )
+                    try:
+                        await queue.put(chunk)
+                    except asyncio.CancelledError:
+                        log.warning("stream_reader_cancelled_put g=%s key=%s", g, key[:16])
+                        raise
+            except asyncio.CancelledError:
+                set_error(span, "cancelled", "stream reader cancelled")
+                log.warning("stream_reader_cancelled g=%s key=%s", g, key[:16])
+                raise
             except Exception as e:
-                log.warning("save_after_exception g=%s key=%s: %s", g, key[:16], e)
-            if ok:
-                hs.clear_restore_poison(key)
+                set_error(span, e.__class__.__name__, str(e))
+                log.exception("stream_reader_error g=%s key=%s: %s", g, key[:16], e)
+            finally:
                 try:
-                    _record_saved_cache(key, prefix, blocks, model_id)
-                except Exception as e:
-                    log.warning("record_saved_cache_exception key=%s: %s", key[:16], e)
-            sm.release(g)
-            log.info("stream_reader_done g=%s key=%s saved=%s", g, key[:16], ok)
-            try:
-                await queue.put(None)
-            except Exception:
-                pass
+                    await resp.aclose()
+                except Exception:
+                    pass
+
+                _maybe_poison_restore(
+                    restore_key,
+                    restored,
+                    model_id,
+                    last_timings,
+                    span,
+                )
+                if persist_cache:
+                    saved = await _save_cache_artifacts(
+                        sm,
+                        g,
+                        key,
+                        prefix,
+                        blocks,
+                        model_id,
+                        span,
+                    )
+                else:
+                    add_lifecycle_event(
+                        span,
+                        "proxycache.cache.save.skipped",
+                        backend_id=g[0],
+                        slot_id=g[1],
+                        cache_key_prefix=key[:16],
+                        reason="small_request",
+                    )
+
+                add_timing_attributes(span, last_timings)
+                _release_slot(sm, g, span)
+                log.info("stream_reader_done g=%s key=%s saved=%s", g, key[:16], saved)
+                if span is not None:
+                    span.end()
+                try:
+                    await queue.put(None)
+                except Exception:
+                    pass
 
     asyncio.create_task(reader())
 
@@ -305,6 +450,7 @@ async def start_stream_task(
 async def start_stream_task_multimodal(
     resp: httpx.Response,
     model_id: str,
+    span=None,
 ) -> AsyncGenerator[bytes, None]:
     """
     Stream task for multimodal backends (no slot management).
@@ -313,36 +459,54 @@ async def start_stream_task_multimodal(
     queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
 
     async def reader():
-        try:
-            log.info("multimodal_stream_reader_start model_id=%s", model_id[:16])
-            async for chunk in resp.aiter_raw():
-                if not chunk:
-                    continue
-                try:
-                    await queue.put(chunk)
-                except asyncio.CancelledError:
-                    log.warning(
-                        "multimodal_stream_reader_cancelled_put model_id=%s",
-                        model_id[:16],
+        with _span_scope(span):
+            try:
+                sse_buffer = b""
+                last_timings: Optional[Dict] = None
+                add_lifecycle_event(
+                    span,
+                    "proxycache.stream.started",
+                    mode="multimodal_passthrough",
+                    model_id=model_id,
+                )
+                log.info("multimodal_stream_reader_start model_id=%s", model_id[:16])
+                async for chunk in resp.aiter_raw():
+                    if not chunk:
+                        continue
+                    sse_buffer += chunk
+                    sse_buffer, last_timings = _consume_sse_timings(
+                        sse_buffer, last_timings
                     )
-                    raise
-        except asyncio.CancelledError:
-            log.warning("multimodal_stream_reader_cancelled model_id=%s", model_id[:16])
-            raise
-        except Exception as e:
-            log.exception(
-                "multimodal_stream_reader_error model_id=%s: %s", model_id[:16], e
-            )
-        finally:
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
-            log.info("multimodal_stream_reader_done model_id=%s", model_id[:16])
-            try:
-                await queue.put(None)
-            except Exception:
-                pass
+                    try:
+                        await queue.put(chunk)
+                    except asyncio.CancelledError:
+                        log.warning(
+                            "multimodal_stream_reader_cancelled_put model_id=%s",
+                            model_id[:16],
+                        )
+                        raise
+            except asyncio.CancelledError:
+                set_error(span, "cancelled", "multimodal stream reader cancelled")
+                log.warning("multimodal_stream_reader_cancelled model_id=%s", model_id[:16])
+                raise
+            except Exception as e:
+                set_error(span, e.__class__.__name__, str(e))
+                log.exception(
+                    "multimodal_stream_reader_error model_id=%s: %s", model_id[:16], e
+                )
+            finally:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+                add_timing_attributes(span, last_timings if "last_timings" in locals() else None)
+                log.info("multimodal_stream_reader_done model_id=%s", model_id[:16])
+                if span is not None:
+                    span.end()
+                try:
+                    await queue.put(None)
+                except Exception:
+                    pass
 
     asyncio.create_task(reader())
 
@@ -363,9 +527,8 @@ def _extract_timings(payload: Optional[Dict]) -> Optional[Dict]:
     return timings if isinstance(timings, dict) else None
 
 
-def _current_recording_span():
-    span = trace.get_current_span()
-    return span if span and span.is_recording() else None
+def _span_scope(span):
+    return trace.use_span(span, end_on_exit=False) if span is not None else nullcontext()
 
 
 def _consume_sse_timings(
@@ -398,6 +561,7 @@ def _maybe_poison_restore(
     restored: Optional[bool],
     model_id: str,
     timings: Optional[Dict],
+    span=None,
 ) -> None:
     if not restore_key or not restored or not timings:
         return
@@ -417,6 +581,15 @@ def _maybe_poison_restore(
                 prompt_n=prompt_n,
                 cache_n=cache_n,
                 prompt_ms=prompt_ms,
+                reason="no_cache_reuse_after_restore",
+            )
+            add_lifecycle_event(
+                span,
+                "proxycache.cache.restore.poisoned",
+                cache_key_prefix=restore_key[:16],
+                model_id=model_id,
+                prompt_tokens=prompt_n,
+                cache_read_tokens=cache_n,
                 reason="no_cache_reuse_after_restore",
             )
         except Exception as e:
@@ -441,261 +614,356 @@ async def chat(req: Request):
 
     be_id = 0
     client = clients[be_id]
+    current_span = start_inference_span(client.base_url, client_model, data)
+    add_input_attributes(current_span, data)
 
-    # model identity and multimodal capability come from /v1/models.
-    backend_model_id, backend_caps = await client.get_model_info()
-    backend_is_multimodal = await client.is_multimodal()
-    request_has_media = _request_has_multimodal_workload(messages)
+    try:
+        with _span_scope(current_span):
+            # model identity and multimodal capability come from /v1/models.
+            backend_model_id, backend_caps = await client.get_model_info()
+            backend_is_multimodal = await client.is_multimodal()
+            request_has_media = _request_has_multimodal_workload(messages)
+            prefix = hs.raw_prefix(messages)
+            full_for_key = backend_model_id + "\n" + prefix
+            key = hs.prefix_key_sha256(full_for_key)
+            blocks = hs.block_hashes_from_text(prefix, WORDS_PER_BLOCK)
+            n_words = len(hs.words_from_text(prefix))
+            is_big = n_words > BIG_THRESHOLD_WORDS
 
-    prefix = hs.raw_prefix(messages)
-    full_for_key = backend_model_id + "\n" + prefix
-    key = hs.prefix_key_sha256(full_for_key)
-    blocks = hs.block_hashes_from_text(prefix, WORDS_PER_BLOCK)
-    n_words = len(hs.words_from_text(prefix))
-    is_big = n_words > BIG_THRESHOLD_WORDS
+            restore_key: Optional[str] = None
+            if is_big:
+                cand = hs.find_best_restore_candidate(
+                    blocks,
+                    WORDS_PER_BLOCK,
+                    LCP_TH,
+                    backend_model_id,
+                )
+            else:
+                cand = None
 
-    restore_key: Optional[str] = None
-    if is_big:
-        cand = hs.find_best_restore_candidate(
-            blocks,
-            WORDS_PER_BLOCK,
-            LCP_TH,
-            backend_model_id,
-        )
-        if cand:
-            restore_key, ratio = cand
+            if cand:
+                restore_key, ratio = cand
+                add_lifecycle_event(
+                    current_span,
+                    "proxycache.cache.restore.candidate.selected",
+                    cache_key_prefix=restore_key[:16],
+                    match_ratio=round(ratio, 6),
+                    request_words=n_words,
+                )
+                log.info(
+                    "restore_candidate basename=%s ratio=%.3f",
+                    restore_key[:16],
+                    ratio,
+                )
+            elif is_big:
+                add_lifecycle_event(
+                    current_span,
+                    "proxycache.cache.restore.candidate.miss",
+                    request_words=n_words,
+                )
+                log.info("restore_candidate none")
+            else:
+                add_lifecycle_event(
+                    current_span,
+                    "proxycache.cache.strategy.small_request",
+                    request_words=n_words,
+                    threshold_words=BIG_THRESHOLD_WORDS,
+                )
+                log.info(
+                    "small_request n_words=%d threshold=%d",
+                    n_words,
+                    BIG_THRESHOLD_WORDS,
+                )
+
             log.info(
-                "restore_candidate basename=%s ratio=%.3f",
-                restore_key[:16],
-                ratio,
+                "before_acquire is_big=%s restore_key=%s",
+                is_big,
+                restore_key[:16] if restore_key else None,
             )
-        else:
-            log.info("restore_candidate none")
-    else:
-        log.info(
-            "small_request n_words=%d threshold=%d",
-            n_words,
-            BIG_THRESHOLD_WORDS,
-        )
 
-    log.info(
-        "before_acquire is_big=%s restore_key=%s",
-        is_big,
-        restore_key[:16] if restore_key else None,
-    )
-
-    if backend_is_multimodal != sm.is_multimodal_backend(be_id):
-        await sm.set_multimodal_backend(be_id, backend_is_multimodal)
-        log.info(
-            "multimodal_backend_detected be_id=%d via=models is_mm=%s",
-            be_id,
-            backend_is_multimodal,
-        )
-
-    log.info(
-        "request_modalities be=%d backend_caps=%s request_has_media=%s",
-        be_id,
-        backend_caps,
-        request_has_media,
-    )
-
-    bypass_slots, bypass_reason = _slot_management_mode(
-        backend_is_multimodal=backend_is_multimodal,
-        backend_model_id=backend_model_id,
-        client_model=client_model,
-        slots_supported=client.slots_supported(),
-    )
-
-    # llama.cpp disables slot save/restore entirely when multimodal support is
-    # enabled for the backend, so the proxy must bypass slot management here.
-    if bypass_slots:
-        from otel import add_cache_attributes, add_llm_attributes, add_timing_attributes, set_error
-
-        current_span = _current_recording_span()
-        add_cache_attributes(current_span, False, key[:32] if key else "")
-        add_llm_attributes(current_span, backend_model_id)
-        if current_span is not None and bypass_reason:
-            current_span.set_attribute("proxycache.slot_bypass", True)
-            current_span.set_attribute("proxycache.slot_bypass_reason", bypass_reason)
-
-        log.info(
-            "slot_passthrough model_id=%s reason=%s request_has_media=%s",
-            backend_model_id,
-            bypass_reason,
-            request_has_media,
-        )
-        body = dict(data)
-        body["model"] = client_model
-        if stream:
-            resp = await client.chat_completions(body, slot_id=None, stream=True)
-            if resp.status_code != 200:
-                err_txt = await resp.aread()
-                await resp.aclose()
-                set_error(current_span, f"upstream_http_{resp.status_code}")
-                return JSONResponse(
-                    {"error": err_txt.decode("utf-8", "ignore")},
-                    status_code=resp.status_code,
-                )
-            gen = await start_stream_task_multimodal(resp, backend_model_id)
-            headers = {
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            }
-            return StreamingResponse(
-                gen, media_type="text/event-stream", headers=headers
-            )
-        else:
-            out = await client.chat_completions(body, slot_id=None, stream=False)
-            if not isinstance(out, dict):
-                set_error(current_span, "provider_non_json_body")
-                return JSONResponse(
-                    {"error": "provider non-JSON body"}, status_code=502
-                )
-            add_timing_attributes(current_span, _extract_timings(out))
-            log.info("multimodal_json_done dur_ms=%d", int((time.time() - t0) * 1000))
-            return JSONResponse(content=out, status_code=200)
-
-    try:
-        g, lock, restored = await asyncio.wait_for(
-            sm.acquire_for_request(restore_key if is_big else None),
-            timeout=ACQUIRE_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        log.error(
-            "acquire_timeout is_big=%s restore_key=%s",
-            is_big,
-            restore_key[:16] if restore_key else None,
-        )
-        return JSONResponse(
-            {"error": "all slots busy, please retry later"},
-            status_code=503,
-        )
-
-    log.info("after_acquire g=%s restored=%s", g, restored)
-
-    be_id, slot_id = g
-    client = clients[be_id]
-
-    from otel import add_cache_attributes, add_llm_attributes, add_timing_attributes, set_error
-
-    current_span = _current_recording_span()
-    n_used = sum(1 for lock in sm._locks.values() if lock.locked())
-    add_cache_attributes(
-        current_span, bool(restored), key[:32] if key else "", slot_id, n_used
-    )
-    add_llm_attributes(current_span, backend_model_id)
-
-    body = dict(data)
-    body["model"] = client_model
-    body["cache_prompt"] = bool(is_big)
-    body["n_keep"] = -1
-
-    opts = dict(body.get("options") or {})
-    opts["slot_id"] = slot_id
-    opts["id_slot"] = slot_id
-    opts["n_keep"] = -1
-    opts["cache_prompt"] = bool(is_big)
-    body["options"] = opts
-
-    log.info(
-        "dispatch be=%d slot=%d is_big=%s (restore_target=%s restored=%s model_id=%s)",
-        be_id,
-        slot_id,
-        is_big,
-        restore_key[:16] if restore_key else None,
-        restored,
-        backend_model_id,
-    )
-
-    try:
-        if stream:
-            resp = await client.chat_completions(
-                body,
-                slot_id=slot_id,
-                stream=True,
-            )
-            if resp.status_code != 200:
-                err_txt = await resp.aread()
-                await resp.aclose()
-                sm.release(g)
-                set_error(current_span, f"upstream_http_{resp.status_code}")
-                return JSONResponse(
-                    {"error": err_txt.decode("utf-8", "ignore")},
-                    status_code=resp.status_code,
+            if backend_is_multimodal != sm.is_multimodal_backend(be_id):
+                await sm.set_multimodal_backend(be_id, backend_is_multimodal)
+                log.info(
+                    "multimodal_backend_detected be_id=%d via=models is_mm=%s",
+                    be_id,
+                    backend_is_multimodal,
                 )
 
-            gen = await start_stream_task(
-                resp,
-                g,
-                key,
-                prefix,
-                blocks,
-                backend_model_id,
-                sm,
-                restore_key=restore_key if is_big else None,
-                restored=restored,
+            log.info(
+                "request_modalities be=%d backend_caps=%s request_has_media=%s",
+                be_id,
+                backend_caps,
+                request_has_media,
             )
 
-            headers = {
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            }
-            return StreamingResponse(
-                gen,
-                media_type="text/event-stream",
-                headers=headers,
+            bypass_slots, bypass_reason = _slot_management_mode(
+                backend_is_multimodal=backend_is_multimodal,
+                backend_model_id=backend_model_id,
+                client_model=client_model,
+                slots_supported=client.slots_supported(),
             )
 
-        else:
-            out = await client.chat_completions(
-                body,
-                slot_id=slot_id,
-                stream=False,
+            add_llm_attributes(
+                current_span,
+                client_model,
+                response_model=backend_model_id,
             )
-            if not isinstance(out, dict):
-                sm.release(g)
-                set_error(current_span, "provider_non_json_body")
-                return JSONResponse(
-                    {"error": "provider non-JSON body"},
-                    status_code=502,
+
+            body = dict(data)
+            body["model"] = client_model
+
+            if bypass_slots:
+                add_cache_attributes(current_span, False)
+                current_span.set_attribute("proxycache.slot.management.bypass", True)
+                current_span.set_attribute(
+                    "proxycache.slot.management.bypass_reason", bypass_reason
                 )
-            add_timing_attributes(current_span, _extract_timings(out))
+                add_lifecycle_event(
+                    current_span,
+                    "proxycache.slot.management.bypassed",
+                    reason=bypass_reason,
+                    request_has_media=request_has_media,
+                    backend_model_id=backend_model_id,
+                )
+                add_lifecycle_event(
+                    current_span,
+                    "proxycache.cache.save.skipped",
+                    reason=bypass_reason,
+                )
 
-            ok = False
+                log.info(
+                    "slot_passthrough model_id=%s reason=%s request_has_media=%s",
+                    backend_model_id,
+                    bypass_reason,
+                    request_has_media,
+                )
+                if stream:
+                    resp = await client.chat_completions(body, slot_id=None, stream=True)
+                    if resp.status_code != 200:
+                        err_txt = await resp.aread()
+                        await resp.aclose()
+                        set_error(
+                            current_span,
+                            f"upstream_http_{resp.status_code}",
+                            "upstream returned non-200 status",
+                        )
+                        current_span.end()
+                        return JSONResponse(
+                            {"error": err_txt.decode("utf-8", "ignore")},
+                            status_code=resp.status_code,
+                        )
+                    gen = await start_stream_task_multimodal(
+                        resp, backend_model_id, current_span
+                    )
+                    headers = {
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                    }
+                    return StreamingResponse(
+                        gen, media_type="text/event-stream", headers=headers
+                    )
+
+                out = await client.chat_completions(body, slot_id=None, stream=False)
+                if not isinstance(out, dict):
+                    set_error(
+                        current_span,
+                        "provider_non_json_body",
+                        "provider returned non-JSON body",
+                    )
+                    current_span.end()
+                    return JSONResponse(
+                        {"error": "provider non-JSON body"}, status_code=502
+                    )
+                add_response_attributes(current_span, out)
+                add_timing_attributes(current_span, _extract_timings(out))
+                current_span.end()
+                log.info("multimodal_json_done dur_ms=%d", int((time.time() - t0) * 1000))
+                return JSONResponse(content=out, status_code=200)
+
             try:
+                g, _lock, restored = await asyncio.wait_for(
+                    sm.acquire_for_request(restore_key if is_big else None),
+                    timeout=ACQUIRE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log.error(
+                    "acquire_timeout is_big=%s restore_key=%s",
+                    is_big,
+                    restore_key[:16] if restore_key else None,
+                )
+                set_error(current_span, "slot_acquire_timeout", "all slots busy")
+                add_lifecycle_event(
+                    current_span,
+                    "proxycache.slot.acquire.timeout",
+                    is_big=is_big,
+                    restore_key_prefix=restore_key[:16] if restore_key else None,
+                )
+                current_span.end()
+                return JSONResponse(
+                    {"error": "all slots busy, please retry later"},
+                    status_code=503,
+                )
+
+            log.info("after_acquire g=%s restored=%s", g, restored)
+            add_lifecycle_event(
+                current_span,
+                "proxycache.slot.acquired",
+                backend_id=g[0],
+                slot_id=g[1],
+                restored=bool(restored),
+                restore_key_prefix=restore_key[:16] if restore_key else None,
+            )
+            _record_restore_outcome(
+                current_span,
+                g,
+                restore_key if is_big else None,
+                restored,
+            )
+
+            be_id, slot_id = g
+            client = clients[be_id]
+
+            n_used = sum(1 for lock in sm._locks.values() if lock.locked())
+            add_cache_attributes(current_span, bool(restored), slot_id, n_used)
+
+            body["cache_prompt"] = bool(is_big)
+            body["n_keep"] = -1
+
+            opts = dict(body.get("options") or {})
+            opts["slot_id"] = slot_id
+            opts["id_slot"] = slot_id
+            opts["n_keep"] = -1
+            opts["cache_prompt"] = bool(is_big)
+            body["options"] = opts
+
+            log.info(
+                "dispatch be=%d slot=%d is_big=%s (restore_target=%s restored=%s model_id=%s)",
+                be_id,
+                slot_id,
+                is_big,
+                restore_key[:16] if restore_key else None,
+                restored,
+                backend_model_id,
+            )
+
+            if stream:
+                resp = None
+                try:
+                    resp = await client.chat_completions(
+                        body,
+                        slot_id=slot_id,
+                        stream=True,
+                    )
+                    if resp.status_code != 200:
+                        err_txt = await resp.aread()
+                        await resp.aclose()
+                        _release_slot(sm, g, current_span)
+                        set_error(
+                            current_span,
+                            f"upstream_http_{resp.status_code}",
+                            "upstream returned non-200 status",
+                        )
+                        current_span.end()
+                        return JSONResponse(
+                            {"error": err_txt.decode("utf-8", "ignore")},
+                            status_code=resp.status_code,
+                        )
+
+                    gen = await start_stream_task(
+                        resp,
+                        g,
+                        key,
+                        prefix,
+                        blocks,
+                        backend_model_id,
+                        sm,
+                        span=current_span,
+                        restore_key=restore_key if is_big else None,
+                        restored=restored,
+                        persist_cache=is_big,
+                    )
+                except Exception:
+                    if resp is not None:
+                        with suppress(Exception):
+                            await resp.aclose()
+                    _release_slot(sm, g, current_span)
+                    raise
+
+                headers = {
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                }
+                return StreamingResponse(
+                    gen,
+                    media_type="text/event-stream",
+                    headers=headers,
+                )
+
+            saved = False
+            try:
+                out = await client.chat_completions(
+                    body,
+                    slot_id=slot_id,
+                    stream=False,
+                )
+                if not isinstance(out, dict):
+                    set_error(
+                        current_span,
+                        "provider_non_json_body",
+                        "provider returned non-JSON body",
+                    )
+                    return JSONResponse(
+                        {"error": "provider non-JSON body"},
+                        status_code=502,
+                    )
+
+                timings = _extract_timings(out)
+                add_response_attributes(current_span, out)
+                add_timing_attributes(current_span, timings)
                 _maybe_poison_restore(
                     restore_key if is_big else None,
                     restored,
                     backend_model_id,
-                    _extract_timings(out),
+                    timings,
+                    current_span,
                 )
+
                 if is_big:
-                    ok = await sm.save_after(g, key)
-                    if ok:
-                        hs.clear_restore_poison(key)
-                        _record_saved_cache(
-                            key,
-                            prefix,
-                            blocks,
-                            backend_model_id,
-                        )
+                    saved = await _save_cache_artifacts(
+                        sm,
+                        g,
+                        key,
+                        prefix,
+                        blocks,
+                        backend_model_id,
+                        current_span,
+                    )
+                else:
+                    add_lifecycle_event(
+                        current_span,
+                        "proxycache.cache.save.skipped",
+                        backend_id=g[0],
+                        slot_id=g[1],
+                        cache_key_prefix=key[:16],
+                        reason="small_request",
+                    )
+
+                log.info(
+                    "json_done g=%s key=%s saved=%s is_big=%s dur_ms=%d",
+                    g,
+                    key[:16],
+                    saved,
+                    is_big,
+                    int((time.time() - t0) * 1000),
+                )
+                return JSONResponse(content=out, status_code=200)
             finally:
-                sm.release(g)
-
-            log.info(
-                "json_done g=%s key=%s saved=%s is_big=%s dur_ms=%d",
-                g,
-                key[:16],
-                ok,
-                is_big,
-                int((time.time() - t0) * 1000),
-            )
-            return JSONResponse(content=out, status_code=200)
-
+                _release_slot(sm, g, current_span)
+                current_span.end()
     except Exception as e:
-        sm.release(g)
-        set_error(current_span, str(e))
-        log.exception("chat_error g=%s key=%s: %s", g, key[:16], e)
+        set_error(current_span, e.__class__.__name__, str(e))
+        current_span.end()
+        log.exception("chat_setup_error: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
