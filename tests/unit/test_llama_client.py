@@ -38,6 +38,26 @@ async def test_chat_completions_returns_error_payload_for_non_json_body(llama_cl
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_chat_completions_returns_error_payload_for_invalid_json_body(llama_client: LlamaClient) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=b"{not-json",
+        )
+
+    await llama_client.client.aclose()
+    llama_client.client = httpx.AsyncClient(base_url=llama_client.base_url, transport=httpx.MockTransport(handler))
+
+    result = await llama_client.chat_completions({"messages": []}, stream=False)
+
+    assert result["object"] == "error"
+    assert result["message"] == "invalid json from provider"
+    assert result["raw"] == "{not-json"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_get_model_info_caches_first_successful_response(llama_client: LlamaClient, mock_backend) -> None:
     mock_backend.model_id = "model-a"
     mock_backend.capabilities = ["multimodal"]
@@ -64,11 +84,54 @@ async def test_get_model_info_returns_unknown_when_request_fails_without_cache(l
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("status_code", [404, 405, 501])
 @pytest.mark.asyncio
-async def test_restore_slot_marks_slots_unsupported_on_404(llama_client: LlamaClient, mock_backend) -> None:
-    mock_backend.slot_restore_status_code = 404
+async def test_restore_slot_marks_slots_unsupported_on_not_supported_status(
+    llama_client: LlamaClient,
+    mock_backend,
+    status_code: int,
+) -> None:
+    mock_backend.slot_restore_status_code = status_code
 
     restored = await llama_client.restore_slot(1, "cache-key")
 
     assert restored is False
     assert llama_client.slots_supported() is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status_code", [404, 405, 501])
+@pytest.mark.asyncio
+async def test_save_slot_marks_slots_unsupported_on_not_supported_status(
+    llama_client: LlamaClient,
+    mock_backend,
+    status_code: int,
+) -> None:
+    mock_backend.slot_save_status_code = status_code
+
+    saved = await llama_client.save_slot(1, "cache-key")
+
+    assert saved is False
+    assert llama_client.slots_supported() is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_save_slot_returns_false_on_500_without_disabling_slots(llama_client: LlamaClient, mock_backend) -> None:
+    mock_backend.slot_save_status_code = 500
+
+    saved = await llama_client.save_slot(1, "cache-key")
+
+    assert saved is False
+    assert llama_client.slots_supported() is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_restore_slot_returns_false_on_non_200_without_disabling_slots(llama_client: LlamaClient, mock_backend) -> None:
+    mock_backend.slot_restore_status_code = 500
+
+    restored = await llama_client.restore_slot(1, "cache-key")
+
+    assert restored is False
+    assert llama_client.slots_supported() is True

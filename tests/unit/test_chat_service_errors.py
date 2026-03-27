@@ -36,17 +36,41 @@ class SpanStub:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("stream", "provider_result", "expected_status", "expected_body"),
+    [
+        (
+            True,
+            {"not": "response"},
+            502,
+            b'{"error":"provider returned invalid streaming response"}',
+        ),
+        (
+            False,
+            "not-a-dict",
+            502,
+            b'{"error":"provider non-JSON body"}',
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_handle_bypass_request_returns_502_for_invalid_stream_response(make_settings, cache_store) -> None:
-    settings = make_settings(name="bypass-stream-invalid")
+async def test_handle_bypass_request_returns_502_for_invalid_provider_payload(
+    make_settings,
+    cache_store,
+    stream: bool,
+    provider_result,
+    expected_status: int,
+    expected_body: bytes,
+) -> None:
+    settings = make_settings(name=f"bypass-invalid-{stream}")
     service = ProxyService(settings, [], SimpleNamespace(), cache_store)
-    client = SimpleNamespace(chat_completions=AsyncMock(return_value={"not": "response"}))
+    client = SimpleNamespace(chat_completions=AsyncMock(return_value=provider_result))
     span = SpanStub()
 
     response = await service._handle_bypass_request(
         client=client,
         body={"messages": []},
-        stream=True,
+        stream=stream,
         backend_model_id="model-a",
         bypass_reason="models_capability",
         request_has_media=True,
@@ -54,8 +78,8 @@ async def test_handle_bypass_request_returns_502_for_invalid_stream_response(mak
         started_at=time.time(),
     )
 
-    assert response.status_code == 502
-    assert response.body == b'{"error":"provider returned invalid streaming response"}'
+    assert response.status_code == expected_status
+    assert response.body == expected_body
     assert span.ended is True
 
 
@@ -82,6 +106,41 @@ async def test_handle_bypass_request_returns_upstream_error_for_non_200_stream(m
     assert result.status_code == 503
     assert result.body == b'{"error":"upstream down"}'
     assert span.ended is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status_code", [500, 503])
+@pytest.mark.asyncio
+async def test_handle_streaming_slot_request_returns_upstream_error_for_non_200_response(
+    make_settings,
+    cache_store,
+    status_code: int,
+) -> None:
+    settings = make_settings(name=f"slot-stream-{status_code}")
+    service = ProxyService(settings, [], SimpleNamespace(), cache_store)
+    released: list[tuple[int, int]] = []
+    service.lifecycle.release_slot = lambda slot, span=None: released.append(slot)
+    client = SimpleNamespace(chat_completions=AsyncMock(return_value=httpx.Response(status_code, content=b"upstream down")))
+    span = SpanStub()
+
+    result = await service._handle_streaming_slot_request(
+        client=client,
+        body={"messages": []},
+        slot=(0, 1),
+        key="cache-key",
+        prefix="prefix",
+        blocks=["a"],
+        backend_model_id="model-a",
+        restore_key=None,
+        restored=None,
+        persist_cache=False,
+        current_span=span,
+    )
+
+    assert result.status_code == status_code
+    assert result.body == b'{"error":"upstream down"}'
+    assert span.ended is True
+    assert released == [(0, 1)]
 
 
 @pytest.mark.unit
@@ -168,5 +227,35 @@ async def test_handle_json_slot_request_returns_502_for_non_dict_payload(make_se
     )
 
     assert result.status_code == 502
+    assert released == [(0, 1)]
+    assert span.ended is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_handle_json_slot_request_releases_slot_and_ends_span_on_exception(make_settings, cache_store) -> None:
+    settings = make_settings(name="json-slot-exc")
+    service = ProxyService(settings, [], SimpleNamespace(), cache_store)
+    released: list[tuple[int, int]] = []
+    service.lifecycle.release_slot = lambda slot, span=None: released.append(slot)
+    client = SimpleNamespace(chat_completions=AsyncMock(side_effect=httpx.ReadTimeout("boom")))
+    span = SpanStub()
+
+    with pytest.raises(httpx.ReadTimeout, match="boom"):
+        await service._handle_json_slot_request(
+            client=client,
+            body={"messages": []},
+            slot=(0, 1),
+            key="cache-key",
+            prefix="prefix",
+            blocks=["a"],
+            backend_model_id="model-a",
+            restore_key=None,
+            restored=None,
+            is_big=True,
+            current_span=span,
+            started_at=time.time(),
+        )
+
     assert released == [(0, 1)]
     assert span.ended is True
