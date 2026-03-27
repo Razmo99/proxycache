@@ -1,6 +1,9 @@
 name: Container Release
 
 on:
+  push:
+    branches:
+      - develop
   release:
     types: [published]
   workflow_dispatch:
@@ -34,10 +37,10 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout release tag
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ github.event_name == 'push' && github.sha || env.RELEASE_TAG }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -59,12 +62,12 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ env.RELEASE_TAG }}
-            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }},enable=${{ !fromJSON(env.IS_PRERELEASE) }}
-            type=semver,pattern={{major}},value=${{ env.RELEASE_TAG }},enable=${{ !fromJSON(env.IS_PRERELEASE) }}
-            type=raw,value=latest,enable=${{ !fromJSON(env.IS_PRERELEASE) }}
-            type=raw,value=main,enable=${{ !fromJSON(env.IS_PRERELEASE) }}
-            type=raw,value=prerelease,enable=${{ fromJSON(env.IS_PRERELEASE) }}
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }},enable=${{ github.event_name != 'push' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }},enable=${{ github.event_name != 'push' && !fromJSON(env.IS_PRERELEASE) }}
+            type=semver,pattern={{major}},value=${{ env.RELEASE_TAG }},enable=${{ github.event_name != 'push' && !fromJSON(env.IS_PRERELEASE) }}
+            type=raw,value=latest,enable=${{ github.event_name != 'push' && !fromJSON(env.IS_PRERELEASE) }}
+            type=raw,value=main,enable=${{ github.event_name != 'push' && !fromJSON(env.IS_PRERELEASE) }}
+            type=raw,value=prerelease,enable=${{ github.event_name != 'push' && fromJSON(env.IS_PRERELEASE) }}
             type=sha
 
       - name: Build and push image
