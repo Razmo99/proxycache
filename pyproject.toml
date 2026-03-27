@@ -63,11 +63,11 @@ commit_message = "chore(release): {version} [skip ci]"
 version_toml = ["pyproject.toml:project.version"]
 
 [tool.semantic_release.branches.main]
-match = "^main$"
+match = "^(main|.+/main)$"
 prerelease = false
 
 [tool.semantic_release.branches.develop]
-match = "^develop$"
+match = "^(develop|.+/develop)$"
 prerelease = true
 prerelease_token = "alpha"
 
