@@ -83,7 +83,7 @@ class MockBackend:
             status_code = self.slot_save_status_code if action == "save" else self.slot_restore_status_code
             return httpx.Response(status_code, json={"ok": status_code == 200})
 
-        body = [] if request.method == "HEAD" else [f"upstream:{request.method}:{request.url.path}".encode("utf-8")]
+        body = [] if request.method == "HEAD" else [f"upstream:{request.method}:{request.url.path}".encode()]
         return httpx.Response(200, stream=StaticAsyncStream(body))
 
 

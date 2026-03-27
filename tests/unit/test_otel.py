@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 
 import pytest
-
 from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_TYPE
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_INPUT_MESSAGES,
@@ -25,7 +24,10 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_USAGE_OUTPUT_TOKENS,
 )
 from opentelemetry.semconv._incubating.attributes.host_attributes import HOST_NAME
-from opentelemetry.semconv.attributes.server_attributes import SERVER_ADDRESS, SERVER_PORT
+from opentelemetry.semconv.attributes.server_attributes import (
+    SERVER_ADDRESS,
+    SERVER_PORT,
+)
 from opentelemetry.semconv.attributes.service_attributes import (
     SERVICE_INSTANCE_ID,
     SERVICE_NAME,
