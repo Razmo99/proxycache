@@ -4,10 +4,25 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to build and publish
+        required: true
+        type: string
+      release_prerelease:
+        description: Whether the release should be treated as a prerelease
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || github.ref_name }}
+  IS_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_prerelease == 'true' || github.event.release.prerelease == true }}
 
 jobs:
   ghcr:
@@ -22,7 +37,7 @@ jobs:
       - name: Checkout release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name || github.ref_name }}
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -43,13 +58,13 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ github.event.release.tag_name || github.ref_name }}
-            type=semver,pattern={{version}},value=${{ github.event.release.tag_name || github.ref_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ github.event.release.tag_name || github.ref_name }},enable=${{ github.event.release.prerelease != true }}
-            type=semver,pattern={{major}},value=${{ github.event.release.tag_name || github.ref_name }},enable=${{ github.event.release.prerelease != true }}
-            type=raw,value=latest,enable=${{ github.event.release.prerelease != true }}
-            type=raw,value=main,enable=${{ github.event.release.prerelease != true }}
-            type=raw,value=prerelease,enable=${{ github.event.release.prerelease == true }}
+            type=raw,value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }},enable=${{ !fromJSON(env.IS_PRERELEASE) }}
+            type=semver,pattern={{major}},value=${{ env.RELEASE_TAG }},enable=${{ !fromJSON(env.IS_PRERELEASE) }}
+            type=raw,value=latest,enable=${{ !fromJSON(env.IS_PRERELEASE) }}
+            type=raw,value=main,enable=${{ !fromJSON(env.IS_PRERELEASE) }}
+            type=raw,value=prerelease,enable=${{ fromJSON(env.IS_PRERELEASE) }}
             type=sha
 
       - name: Build and push image
