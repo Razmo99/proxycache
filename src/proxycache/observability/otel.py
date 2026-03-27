@@ -1,26 +1,26 @@
-# otel.py
 # -*- coding: utf-8 -*-
 
-"""
-OpenTelemetry instrumentation for proxycache.
-Uses automatic HTTP instrumentation plus manual GenAI client spans.
-"""
+"""OpenTelemetry instrumentation for proxycache."""
 
-from urllib.parse import urlparse
+from __future__ import annotations
+
 import json
+import logging
+import os
+import socket
+from urllib.parse import urlparse
 
 from opentelemetry import trace
 from opentelemetry._logs import get_logger_provider, set_logger_provider
 from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
-from opentelemetry.semconv.attributes.server_attributes import (
-    SERVER_ADDRESS,
-    SERVER_PORT,
-)
-from opentelemetry.semconv.attributes.service_attributes import (
-    SERVICE_INSTANCE_ID,
-    SERVICE_NAME,
-    SERVICE_VERSION,
-)
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.semconv._incubating.attributes.error_attributes import ERROR_TYPE
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_INPUT_MESSAGES,
@@ -48,22 +48,18 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_USAGE_OUTPUT_TOKENS,
 )
 from opentelemetry.semconv._incubating.attributes.host_attributes import HOST_NAME
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-from opentelemetry.sdk.resources import Resource
-
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.semconv.attributes.server_attributes import (
+    SERVER_ADDRESS,
+    SERVER_PORT,
+)
+from opentelemetry.semconv.attributes.service_attributes import (
+    SERVICE_INSTANCE_ID,
+    SERVICE_NAME,
+    SERVICE_VERSION,
+)
 from opentelemetry.trace import SpanKind, Status, StatusCode
 
-import os
-import logging
-import socket
-from version import __version__
-
+from proxycache import __version__
 
 _TRACER_NAME = "proxycache.genai"
 _DEFAULT_GEN_AI_PROVIDER = os.getenv("OTEL_GEN_AI_PROVIDER", "").strip() or "openai"
@@ -109,10 +105,7 @@ def _configure_otel_logging(resource: Resource, endpoint: str) -> None:
         return
 
     if _LOGGING_HANDLER is None:
-        _LOGGING_HANDLER = LoggingHandler(
-            level=logging.NOTSET,
-            logger_provider=_LOGGER_PROVIDER,
-        )
+        _LOGGING_HANDLER = LoggingHandler(level=logging.NOTSET, logger_provider=_LOGGER_PROVIDER)
 
     root_logger = logging.getLogger()
     if _LOGGING_HANDLER not in root_logger.handlers:
@@ -128,11 +121,7 @@ def _resource_attributes() -> dict[str, str]:
         or socket.gethostname().strip()
         or "unknown-host"
     )
-    instance_id = (
-        os.getenv("OTEL_SERVICE_INSTANCE_ID", "").strip()
-        or f"{service_name}@{host_name}"
-    )
-
+    instance_id = os.getenv("OTEL_SERVICE_INSTANCE_ID", "").strip() or f"{service_name}@{host_name}"
     return {
         SERVICE_NAME: service_name,
         SERVICE_VERSION: service_version,
@@ -147,11 +136,8 @@ def init_otel(app, httpx_client) -> None:
     global _INSTRUMENTED_HTTPX_CLIENT
 
     resource = Resource.create(_resource_attributes())
-
     otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
-    otlp_logs_endpoint = (
-        os.getenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "").strip() or otlp_endpoint
-    )
+    otlp_logs_endpoint = os.getenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "").strip() or otlp_endpoint
 
     tracer_provider = trace.get_tracer_provider()
     if isinstance(tracer_provider, TracerProvider):
@@ -159,8 +145,7 @@ def init_otel(app, httpx_client) -> None:
     elif _TRACER_PROVIDER is None:
         provider = TracerProvider(resource=resource)
         if otlp_endpoint:
-            exporter = OTLPSpanExporter(**_otlp_exporter_kwargs(otlp_endpoint))
-            provider.add_span_processor(BatchSpanProcessor(exporter))
+            provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(**_otlp_exporter_kwargs(otlp_endpoint))))
         trace.set_tracer_provider(provider)
         current_provider = trace.get_tracer_provider()
         if isinstance(current_provider, TracerProvider):
@@ -174,10 +159,7 @@ def init_otel(app, httpx_client) -> None:
         _INSTRUMENTED_APP = app
 
     if httpx_client is not None and _INSTRUMENTED_HTTPX_CLIENT is not httpx_client:
-        HTTPXClientInstrumentor.instrument_client(
-            httpx_client,
-            tracer_provider=_TRACER_PROVIDER,
-        )
+        HTTPXClientInstrumentor.instrument_client(httpx_client, tracer_provider=_TRACER_PROVIDER)
         _INSTRUMENTED_HTTPX_CLIENT = httpx_client
 
 
@@ -190,7 +172,6 @@ def shutdown_otel() -> None:
     if _INSTRUMENTED_HTTPX_CLIENT is not None:
         HTTPXClientInstrumentor.uninstrument_client(_INSTRUMENTED_HTTPX_CLIENT)
         _INSTRUMENTED_HTTPX_CLIENT = None
-
     if _INSTRUMENTED_APP is not None:
         FastAPIInstrumentor.uninstrument_app(_INSTRUMENTED_APP)
         _INSTRUMENTED_APP = None
@@ -198,7 +179,6 @@ def shutdown_otel() -> None:
     tracer_provider = trace.get_tracer_provider()
     if hasattr(tracer_provider, "force_flush"):
         tracer_provider.force_flush()
-
     if _LOGGER_PROVIDER is not None:
         if _LOGGING_HANDLER is not None:
             logging.getLogger().removeHandler(_LOGGING_HANDLER)
@@ -212,22 +192,19 @@ def get_tracer():
 
 def _server_attributes(base_url: str) -> dict[str, object]:
     parsed = urlparse(base_url)
-    attrs: dict[str, object] = {}
-
+    attributes: dict[str, object] = {}
     if parsed.hostname:
-        attrs[SERVER_ADDRESS] = parsed.hostname
+        attributes[SERVER_ADDRESS] = parsed.hostname
     if parsed.port is not None:
-        attrs[SERVER_PORT] = parsed.port
-
-    return attrs
+        attributes[SERVER_PORT] = parsed.port
+    return attributes
 
 
 def _request_attributes(payload: dict | None) -> dict[str, object]:
     if not isinstance(payload, dict):
         return {}
 
-    attrs: dict[str, object] = {}
-
+    attributes: dict[str, object] = {}
     for key, attr_name in (
         ("max_tokens", GEN_AI_REQUEST_MAX_TOKENS),
         ("n", GEN_AI_REQUEST_CHOICE_COUNT),
@@ -239,29 +216,29 @@ def _request_attributes(payload: dict | None) -> dict[str, object]:
     ):
         value = payload.get(key)
         if value is not None:
-            attrs[attr_name] = value
+            attributes[attr_name] = value
 
     stop_sequences = payload.get("stop")
     if isinstance(stop_sequences, list) and stop_sequences:
-        attrs[GEN_AI_REQUEST_STOP_SEQUENCES] = stop_sequences
+        attributes[GEN_AI_REQUEST_STOP_SEQUENCES] = stop_sequences
     elif isinstance(stop_sequences, str) and stop_sequences:
-        attrs[GEN_AI_REQUEST_STOP_SEQUENCES] = [stop_sequences]
+        attributes[GEN_AI_REQUEST_STOP_SEQUENCES] = [stop_sequences]
 
     options = payload.get("options")
     if isinstance(options, dict):
         top_k = options.get("top_k")
         if top_k is not None:
-            attrs[GEN_AI_REQUEST_TOP_K] = top_k
+            attributes[GEN_AI_REQUEST_TOP_K] = top_k
 
     response_format = payload.get("response_format")
     if isinstance(response_format, dict):
-        fmt_type = str(response_format.get("type") or "").lower()
-        if fmt_type in {"json_object", "json_schema"}:
-            attrs[GEN_AI_OUTPUT_TYPE] = "json"
-        elif fmt_type in {"text", "json", "image", "speech"}:
-            attrs[GEN_AI_OUTPUT_TYPE] = fmt_type
+        format_type = str(response_format.get("type") or "").lower()
+        if format_type in {"json_object", "json_schema"}:
+            attributes[GEN_AI_OUTPUT_TYPE] = "json"
+        elif format_type in {"text", "json", "image", "speech"}:
+            attributes[GEN_AI_OUTPUT_TYPE] = format_type
 
-    return attrs
+    return attributes
 
 
 def _json_attribute(value: object) -> str:
@@ -319,7 +296,6 @@ def _part_from_content_item(item: object) -> list[dict[str, object]]:
 def _message_parts(message: dict) -> list[dict[str, object]]:
     parts: list[dict[str, object]] = []
     content = message.get("content")
-
     if isinstance(content, list):
         for item in content:
             parts.extend(_part_from_content_item(item))
@@ -340,19 +316,14 @@ def _message_parts(message: dict) -> list[dict[str, object]]:
                     "arguments": function.get("arguments"),
                 }
             )
-
     if not parts:
         parts.append(_text_part(""))
-
     return parts
 
 
 def add_input_attributes(span, payload: dict | None) -> None:
-    if not _CAPTURE_CONTENT or span is None or not span.is_recording():
+    if not _CAPTURE_CONTENT or span is None or not span.is_recording() or not isinstance(payload, dict):
         return
-    if not isinstance(payload, dict):
-        return
-
     messages = payload.get("messages")
     if isinstance(messages, list):
         input_messages: list[dict[str, object]] = []
@@ -366,12 +337,8 @@ def add_input_attributes(span, payload: dict | None) -> None:
                 system_instructions.extend(parts)
             else:
                 input_messages.append({"role": role, "parts": parts})
-
         if system_instructions:
-            span.set_attribute(
-                GEN_AI_SYSTEM_INSTRUCTIONS,
-                _json_attribute(system_instructions),
-            )
+            span.set_attribute(GEN_AI_SYSTEM_INSTRUCTIONS, _json_attribute(system_instructions))
         if input_messages:
             span.set_attribute(GEN_AI_INPUT_MESSAGES, _json_attribute(input_messages))
 
@@ -381,27 +348,17 @@ def add_input_attributes(span, payload: dict | None) -> None:
 
 
 def start_inference_span(base_url: str, model: str, payload: dict | None = None):
-    attrs: dict[str, object] = {
+    attributes: dict[str, object] = {
         GEN_AI_OPERATION_NAME: "chat",
         GEN_AI_PROVIDER_NAME: _DEFAULT_GEN_AI_PROVIDER,
         GEN_AI_REQUEST_MODEL: model,
     }
-    attrs.update(_server_attributes(base_url))
-    attrs.update(_request_attributes(payload))
-    span_name = f"chat {model}".strip()
-    return get_tracer().start_span(
-        span_name,
-        kind=SpanKind.CLIENT,
-        attributes=attrs,
-    )
+    attributes.update(_server_attributes(base_url))
+    attributes.update(_request_attributes(payload))
+    return get_tracer().start_span(f"chat {model}".strip(), kind=SpanKind.CLIENT, attributes=attributes)
 
 
-def add_cache_attributes(
-    span,
-    cache_hit: bool,
-    slot_id: int | None = None,
-    n_used: int | None = None,
-) -> None:
+def add_cache_attributes(span, cache_hit: bool, slot_id: int | None = None, n_used: int | None = None) -> None:
     if span is None or not span.is_recording():
         return
     span.set_attribute("proxycache.cache.hit", cache_hit)
@@ -411,11 +368,7 @@ def add_cache_attributes(
         span.set_attribute("proxycache.slot.in_use_count", n_used)
 
 
-def add_llm_attributes(
-    span,
-    model: str,
-    response_model: str | None = None,
-) -> None:
+def add_llm_attributes(span, model: str, response_model: str | None = None) -> None:
     if span is None or not span.is_recording():
         return
     span.set_attribute(GEN_AI_REQUEST_MODEL, model)
@@ -427,11 +380,9 @@ def add_llm_attributes(
 def add_response_attributes(span, payload: dict | None) -> None:
     if span is None or not span.is_recording() or not isinstance(payload, dict):
         return
-
     response_id = payload.get("id")
     if response_id:
         span.set_attribute(GEN_AI_RESPONSE_ID, str(response_id))
-
     response_model = payload.get("model")
     if response_model:
         span.set_attribute(GEN_AI_RESPONSE_MODEL, str(response_model))
@@ -461,22 +412,17 @@ def add_response_attributes(span, payload: dict | None) -> None:
                     }
                 )
             if output_messages:
-                span.set_attribute(
-                    GEN_AI_OUTPUT_MESSAGES,
-                    _json_attribute(output_messages),
-                )
+                span.set_attribute(GEN_AI_OUTPUT_MESSAGES, _json_attribute(output_messages))
 
 
 def add_timing_attributes(span, timings: dict | None) -> None:
     if span is None or not span.is_recording() or not timings:
         return
-
     prompt_n = timings.get("prompt_n")
     predicted_n = timings.get("predicted_n")
     cache_n = timings.get("cache_n")
     prompt_ms = timings.get("prompt_ms")
     predicted_ms = timings.get("predicted_ms")
-
     if prompt_n is not None:
         span.set_attribute(GEN_AI_USAGE_INPUT_TOKENS, int(prompt_n))
     if predicted_n is not None:
@@ -499,14 +445,9 @@ def set_error(span, error_type: str, description: str | None = None) -> None:
 def add_lifecycle_event(span, name: str, **attributes: object) -> None:
     if span is None or not span.is_recording():
         return
-
     event_attributes: dict[str, object] = {}
     for key, value in attributes.items():
         if value is None:
             continue
-        if isinstance(value, (bool, int, float, str)):
-            event_attributes[key] = value
-        else:
-            event_attributes[key] = str(value)
-
+        event_attributes[key] = value if isinstance(value, (bool, int, float, str)) else str(value)
     span.add_event(name, event_attributes)

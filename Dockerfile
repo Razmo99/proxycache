@@ -1,12 +1,13 @@
-FROM python:3.14-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-COPY . ./
+COPY pyproject.toml README.md ./
+COPY src ./src
 
 RUN pip install --no-cache-dir .
 
-CMD ["python3", "proxycache.py"]
+CMD ["python", "-m", "proxycache"]
