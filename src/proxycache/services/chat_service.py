@@ -78,7 +78,20 @@ class ProxyService:
             params=request.query_params,
             headers=headers,
         )
-        response = await client.client.send(upstream_request, stream=True)
+        try:
+            response = await client.client.send(upstream_request, stream=True)
+        except httpx.RequestError as exc:
+            log.warning(
+                "upstream_passthrough_request_error method=%s path=%s base_url=%s err=%s",
+                request.method,
+                upstream_path,
+                getattr(client, "base_url", "unknown"),
+                exc,
+            )
+            return JSONResponse(
+                {"error": f"upstream request failed: {exc}"},
+                status_code=502,
+            )
         response_headers = {
             key: value
             for key, value in response.headers.items()

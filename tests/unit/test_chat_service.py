@@ -87,3 +87,59 @@ async def test_proxy_upstream_request_head_returns_empty_body(make_settings) -> 
     assert response.headers["x-upstream"] == "ok"
     assert "content-length" not in response.headers
     assert request_sent[0].method == "HEAD"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_proxy_upstream_request_returns_502_for_connect_error(make_settings) -> None:
+    settings = make_settings(name="chat-service-connect-error")
+
+    async def send(request: httpx.Request, stream: bool = False) -> httpx.Response:
+        raise httpx.ConnectError("Name or service not known", request=request)
+
+    fake_httpx_client = type(
+        "FakeHTTPXClient",
+        (),
+        {
+            "build_request": staticmethod(
+                lambda method, path, params=None, headers=None: httpx.Request(
+                    method,
+                    f"http://backend.test{path}",
+                    params=params,
+                    headers=headers,
+                )
+            ),
+            "send": staticmethod(send),
+        },
+    )()
+    fake_client = type(
+        "FakeClient",
+        (),
+        {
+            "base_url": "http://backend.test",
+            "client": fake_httpx_client,
+            "close": staticmethod(lambda: asyncio.sleep(0)),
+        },
+    )()
+    slot_manager = SlotManager(settings.backends)
+    cache_store = CacheStore(settings.meta_dir, settings.slot_save_path, settings.words_per_block, settings.max_saved_caches)
+    service = ProxyService(settings, [fake_client], slot_manager, cache_store)
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/metrics",
+            "raw_path": b"/metrics",
+            "scheme": "http",
+            "query_string": b"",
+            "headers": [(b"host", b"testserver")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+        }
+    )
+
+    response = await service.proxy_upstream_request(request, "/metrics")
+
+    assert response.status_code == 502
+    assert response.body == b'{"error":"upstream request failed: Name or service not known"}'
