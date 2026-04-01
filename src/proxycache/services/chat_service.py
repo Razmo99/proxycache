@@ -23,6 +23,7 @@ from proxycache.observability.otel import (
     add_input_attributes,
     add_lifecycle_event,
     add_llm_attributes,
+    add_restore_attributes,
     add_response_attributes,
     add_timing_attributes,
     set_error,
@@ -146,7 +147,10 @@ class ProxyService:
         backend_model_id, backend_capabilities = await client.get_model_info()
         backend_is_multimodal = await client.is_multimodal()
         request_has_media = request_has_multimodal_workload(messages)
-        prefix = self.cache_store.raw_prefix(messages)
+        tools = payload.get("tools")
+        prefix = self.cache_store.raw_prefix(messages, tools=tools if isinstance(tools, list) else None)
+        system_fingerprint = self.cache_store.system_fingerprint(messages)
+        tools_fingerprint = self.cache_store.tools_fingerprint(tools if isinstance(tools, list) else None)
         key = self.cache_store.prefix_key_sha256(f"{backend_model_id}\n{prefix}")
         blocks = self.cache_store.block_hashes_from_text(prefix, self.settings.words_per_block)
         n_words = len(self.cache_store.words_from_text(prefix))
@@ -158,22 +162,48 @@ class ProxyService:
                 self.settings.words_per_block,
                 self.settings.lcp_threshold,
                 backend_model_id,
+                system_fingerprint=system_fingerprint,
+                tools_fingerprint=tools_fingerprint,
             )
             if is_big
             else None
         )
         restore_key: str | None = None
+        restore_match_ratio: float | None = None
         if restore_candidate:
-            restore_key, ratio = restore_candidate
+            restore_key = restore_candidate.key
+            restore_match_ratio = restore_candidate.match_ratio
+            add_restore_attributes(
+                current_span,
+                match_ratio=restore_candidate.match_ratio,
+                lcp_blocks=restore_candidate.lcp_blocks,
+                request_block_count=restore_candidate.request_block_count,
+                candidate_block_count=restore_candidate.candidate_block_count,
+            )
             add_lifecycle_event(
                 current_span,
                 "proxycache.cache.restore.candidate.selected",
                 cache_key_prefix=restore_key[:16],
-                match_ratio=round(ratio, 6),
+                match_ratio=round(restore_candidate.match_ratio, 6),
+                lcp_blocks=restore_candidate.lcp_blocks,
+                request_block_count=restore_candidate.request_block_count,
+                candidate_block_count=restore_candidate.candidate_block_count,
                 request_words=n_words,
             )
-            log.info("restore_candidate basename=%s ratio=%.3f", restore_key[:16], ratio)
+            log.info(
+                "restore_candidate basename=%s ratio=%.3f lcp_blocks=%d req_blocks=%d cand_blocks=%d",
+                restore_key[:16],
+                restore_candidate.match_ratio,
+                restore_candidate.lcp_blocks,
+                restore_candidate.request_block_count,
+                restore_candidate.candidate_block_count,
+            )
         elif is_big:
+            add_restore_attributes(
+                current_span,
+                match_ratio=0.0,
+                request_block_count=len(blocks),
+            )
             add_lifecycle_event(current_span, "proxycache.cache.restore.candidate.miss", request_words=n_words)
             log.info("restore_candidate none")
         else:
@@ -277,8 +307,11 @@ class ProxyService:
                 blocks=blocks,
                 backend_model_id=backend_model_id,
                 restore_key=restore_key if is_big else None,
+                restore_match_ratio=restore_match_ratio,
                 restored=restored,
                 persist_cache=is_big,
+                system_fingerprint=system_fingerprint,
+                tools_fingerprint=tools_fingerprint,
                 current_span=current_span,
             )
 
@@ -291,8 +324,11 @@ class ProxyService:
             blocks=blocks,
             backend_model_id=backend_model_id,
             restore_key=restore_key if is_big else None,
+            restore_match_ratio=restore_match_ratio,
             restored=restored,
             is_big=is_big,
+            system_fingerprint=system_fingerprint,
+            tools_fingerprint=tools_fingerprint,
             current_span=current_span,
             started_at=started_at,
         )
@@ -371,8 +407,11 @@ class ProxyService:
         blocks: list[str],
         backend_model_id: str,
         restore_key: str | None,
+        restore_match_ratio: float | None,
         restored: bool | None,
         persist_cache: bool,
+        system_fingerprint: str,
+        tools_fingerprint: str,
         current_span,
     ) -> Response:
         response: httpx.Response | None = None
@@ -407,8 +446,11 @@ class ProxyService:
                 backend_model_id,
                 current_span,
                 restore_key,
+                restore_match_ratio,
                 restored,
                 persist_cache,
+                system_fingerprint,
+                tools_fingerprint,
             )
         except Exception:
             if response is not None:
@@ -433,8 +475,11 @@ class ProxyService:
         blocks: list[str],
         backend_model_id: str,
         restore_key: str | None,
+        restore_match_ratio: float | None,
         restored: bool | None,
         is_big: bool,
+        system_fingerprint: str,
+        tools_fingerprint: str,
         current_span,
         started_at: float,
     ) -> Response:
@@ -468,13 +513,20 @@ class ProxyService:
             timings = extract_timings(output)
             add_response_attributes(current_span, output)
             add_timing_attributes(current_span, timings)
-            self.lifecycle.maybe_poison_restore(
+            restore_assessment = self.lifecycle.assess_restore_quality(
                 restore_key,
                 restored,
                 backend_model_id,
                 timings,
-                current_span,
+                match_ratio=restore_match_ratio,
+                span=current_span,
             )
+            if restore_assessment is not None:
+                add_restore_attributes(
+                    current_span,
+                    actual_ratio=restore_assessment.actual_ratio,
+                    degraded=restore_assessment.degraded,
+                )
 
             if is_big:
                 saved = await self.lifecycle.save_cache_artifacts(
@@ -483,6 +535,8 @@ class ProxyService:
                     prefix=prefix,
                     blocks=blocks,
                     model_id=backend_model_id,
+                    system_fingerprint=system_fingerprint,
+                    tools_fingerprint=tools_fingerprint,
                     span=current_span,
                 )
             else:

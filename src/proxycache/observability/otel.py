@@ -368,6 +368,32 @@ def add_cache_attributes(span, cache_hit: bool, slot_id: int | None = None, n_us
         span.set_attribute("proxycache.slot.in_use_count", n_used)
 
 
+def add_restore_attributes(
+    span,
+    *,
+    match_ratio: float | None = None,
+    lcp_blocks: int | None = None,
+    request_block_count: int | None = None,
+    candidate_block_count: int | None = None,
+    actual_ratio: float | None = None,
+    degraded: bool | None = None,
+) -> None:
+    if span is None or not span.is_recording():
+        return
+    if match_ratio is not None:
+        span.set_attribute("proxycache.cache.restore.match_ratio", float(match_ratio))
+    if lcp_blocks is not None:
+        span.set_attribute("proxycache.cache.restore.lcp_blocks", int(lcp_blocks))
+    if request_block_count is not None:
+        span.set_attribute("proxycache.cache.restore.request_block_count", int(request_block_count))
+    if candidate_block_count is not None:
+        span.set_attribute("proxycache.cache.restore.candidate_block_count", int(candidate_block_count))
+    if actual_ratio is not None:
+        span.set_attribute("proxycache.cache.restore.actual_read_ratio", float(actual_ratio))
+    if degraded is not None:
+        span.set_attribute("proxycache.cache.restore.degraded", degraded)
+
+
 def add_llm_attributes(span, model: str, response_model: str | None = None) -> None:
     if span is None or not span.is_recording():
         return

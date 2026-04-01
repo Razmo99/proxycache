@@ -5,16 +5,16 @@ metricsMaxInMemory: 1000
 models:
   qwen_0_5b_instruct:
     checkEndpoint: /v1/models
-    proxy: http://127.0.0.1:${PORT}
+    proxy: http://proxycache:8081
     cmd: >
       /app/run-model.sh
       /models/qwen2.5-0.5b-instruct-q4_k_m.gguf
-      ${PORT}
+      5800
 
   qwen_coder_0_5b_instruct:
     checkEndpoint: /v1/models
-    proxy: http://127.0.0.1:${PORT}
+    proxy: http://proxycache:8081
     cmd: >
       /app/run-model.sh
       /models/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf
-      ${PORT}
+      5800

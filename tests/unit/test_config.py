@@ -35,8 +35,64 @@ def test_settings_reject_invalid_float(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.unit
-def test_default_slot_save_path_uses_parent_parent_for_meta_dir_named_meta(tmp_path: Path) -> None:
+def test_default_slot_save_path_uses_parent_parent_for_meta_dir_named_meta(
+    tmp_path: Path,
+) -> None:
     meta_dir = tmp_path / "kv" / "meta"
 
     assert _default_slot_save_path(meta_dir) == tmp_path
 
+
+@pytest.mark.unit
+def test_ensure_directories_creates_missing_directories(tmp_path: Path) -> None:
+    from proxycache.config import Settings
+
+    meta_dir = tmp_path / "slots" / "model" / "meta"
+    settings = Settings(
+        backends=(),
+        words_per_block=100,
+        big_threshold_words=500,
+        lcp_threshold=0.6,
+        meta_dir=meta_dir,
+        slot_save_path=tmp_path / "slots",
+        request_timeout=600.0,
+        model_id="test",
+        port=8080,
+        log_level="INFO",
+        max_saved_caches=4,
+    )
+
+    assert not meta_dir.exists()
+    assert not (tmp_path / "slots").exists()
+
+    settings.ensure_directories()
+
+    assert meta_dir.exists()
+    assert (tmp_path / "slots").exists()
+
+
+@pytest.mark.unit
+def test_ensure_directories_skips_existing_directories(tmp_path: Path) -> None:
+    from proxycache.config import Settings
+
+    meta_dir = tmp_path / "slots" / "model" / "meta"
+    meta_dir.mkdir(parents=True)
+
+    settings = Settings(
+        backends=(),
+        words_per_block=100,
+        big_threshold_words=500,
+        lcp_threshold=0.6,
+        meta_dir=meta_dir,
+        slot_save_path=tmp_path / "slots",
+        request_timeout=600.0,
+        model_id="test",
+        port=8080,
+        log_level="INFO",
+        max_saved_caches=4,
+    )
+
+    settings.ensure_directories()
+
+    assert meta_dir.exists()
+    assert (tmp_path / "slots").exists()

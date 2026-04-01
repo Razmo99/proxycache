@@ -132,8 +132,11 @@ async def test_handle_streaming_slot_request_returns_upstream_error_for_non_200_
         blocks=["a"],
         backend_model_id="model-a",
         restore_key=None,
+        restore_match_ratio=None,
         restored=None,
         persist_cache=False,
+        system_fingerprint="",
+        tools_fingerprint="",
         current_span=span,
     )
 
@@ -162,8 +165,11 @@ async def test_handle_streaming_slot_request_returns_502_for_invalid_response(ma
         blocks=["a"],
         backend_model_id="model-a",
         restore_key=None,
+        restore_match_ratio=None,
         restored=None,
         persist_cache=False,
+        system_fingerprint="",
+        tools_fingerprint="",
         current_span=span,
     )
 
@@ -193,8 +199,11 @@ async def test_handle_streaming_slot_request_releases_slot_on_exception(make_set
             blocks=["a"],
             backend_model_id="model-a",
             restore_key=None,
+            restore_match_ratio=None,
             restored=None,
             persist_cache=False,
+            system_fingerprint="",
+            tools_fingerprint="",
             current_span=SpanStub(),
         )
 
@@ -220,8 +229,11 @@ async def test_handle_json_slot_request_returns_502_for_non_dict_payload(make_se
         blocks=["a"],
         backend_model_id="model-a",
         restore_key=None,
+        restore_match_ratio=None,
         restored=None,
         is_big=False,
+        system_fingerprint="",
+        tools_fingerprint="",
         current_span=span,
         started_at=time.time(),
     )
@@ -251,8 +263,11 @@ async def test_handle_json_slot_request_releases_slot_and_ends_span_on_exception
             blocks=["a"],
             backend_model_id="model-a",
             restore_key=None,
+            restore_match_ratio=None,
             restored=None,
             is_big=True,
+            system_fingerprint="",
+            tools_fingerprint="",
             current_span=span,
             started_at=time.time(),
         )
@@ -290,8 +305,11 @@ async def test_handle_json_slot_request_returns_upstream_status_and_poisons_fail
         blocks=["a"],
         backend_model_id="model-a",
         restore_key="restore-key",
+        restore_match_ratio=1.0,
         restored=True,
         is_big=True,
+        system_fingerprint="",
+        tools_fingerprint="",
         current_span=span,
         started_at=time.time(),
     )
@@ -332,8 +350,11 @@ async def test_handle_json_slot_request_does_not_poison_candidate_when_restore_n
         blocks=["a"],
         backend_model_id="model-a",
         restore_key="restore-key",
+        restore_match_ratio=None,
         restored=False,
         is_big=True,
+        system_fingerprint="",
+        tools_fingerprint="",
         current_span=span,
         started_at=time.time(),
     )

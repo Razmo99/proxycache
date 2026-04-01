@@ -260,12 +260,17 @@ class RealSmokeStack:
     backend_image: str
     meta_volume: str
     cache_volume: str
+    model_port: int
     backend_ctx_size: int
     backend_extra_args: str
 
     @property
     def proxy_url(self) -> str:
         return f"http://127.0.0.1:{self.proxy_port}"
+
+    @property
+    def ingress_url(self) -> str:
+        return f"http://127.0.0.1:{self.backend_port}/upstream/{self.model_preset_name}"
 
     def start(self) -> None:
         _docker("network", "create", self.network_name)
@@ -293,7 +298,7 @@ class RealSmokeStack:
         backends = json.dumps(
             [
                 {
-                    "url": f"http://llama-swap:8080/upstream/{self.model_preset_name}",
+                    "url": f"http://llama-swap:{self.model_port}",
                     "n_slots": 1,
                 }
             ]
@@ -307,6 +312,8 @@ class RealSmokeStack:
             self.network_name,
             "-p",
             f"{self.proxy_port}:8081",
+            "--network-alias",
+            "proxycache",
             "-e",
             f"BACKENDS={backends}",
             "-e",
@@ -338,6 +345,14 @@ class RealSmokeStack:
         _wait_for_http(
             f"{self.proxy_url}/v1/models",
             timeout_s=_env_float("REAL_SMOKE_PROXY_READY_TIMEOUT", 120.0),
+        )
+        _wait_for_http(
+            f"{self.ingress_url}/v1/models",
+            timeout_s=_env_float("REAL_SMOKE_PROXY_READY_TIMEOUT", 120.0),
+        )
+        self._wait_for_model_http(
+            f"http://127.0.0.1:{self.model_port}/v1/models",
+            timeout_s=_env_float("REAL_SMOKE_BACKEND_READY_TIMEOUT", 300.0),
         )
 
     def _start_backend_container(self) -> None:
@@ -381,6 +396,14 @@ class RealSmokeStack:
             self.backend_extra_args = backend_extra_args.strip()
         _docker("rm", "-f", self.backend_name, check=False)
         self._start_backend_container()
+        _wait_for_http(
+            f"{self.ingress_url}/v1/models",
+            timeout_s=_env_float("REAL_SMOKE_PROXY_READY_TIMEOUT", 120.0),
+        )
+        self._wait_for_model_http(
+            f"http://127.0.0.1:{self.model_port}/v1/models",
+            timeout_s=_env_float("REAL_SMOKE_BACKEND_READY_TIMEOUT", 300.0),
+        )
 
     def logs(self) -> str:
         chunks: list[str] = []
@@ -388,6 +411,26 @@ class RealSmokeStack:
             result = _docker("logs", name, check=False)
             chunks.append(f"== {name} ==\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
         return "\n\n".join(chunks)
+
+    def _wait_for_model_http(self, url: str, timeout_s: float) -> None:
+        deadline = time.time() + timeout_s
+        last_output = ""
+        command = (
+            "curl -sS -o /tmp/real-smoke-model-ready.json -w '%{http_code}' "
+            + shlex.quote(url)
+        )
+        while time.time() < deadline:
+            result = self._exec_in_backend(command)
+            status = result.stdout.strip()
+            if result.returncode == 0 and status == "200":
+                return
+            body = self._exec_in_backend("cat /tmp/real-smoke-model-ready.json 2>/dev/null || true")
+            last_output = (
+                f"code={result.returncode} status={status} "
+                f"stderr={result.stderr.strip()} body={body.stdout.strip()}"
+            )
+            time.sleep(1.0)
+        raise AssertionError(f"service at {url} did not become ready: {last_output}")
 
     def meta_files(self) -> list[str]:
         result = _docker(
@@ -476,7 +519,7 @@ class RealSmokeStack:
         quoted_payload = shlex.quote(json.dumps(payload, separators=(",", ":")))
         command = (
             "curl -sS -X POST "
-            f"{shlex.quote(f'http://127.0.0.1:8080/upstream/{self.model_preset_name}{path}')}"
+            f"{shlex.quote(f'http://127.0.0.1:{self.model_port}{path}')}"
             " -H 'Content-Type: application/json' "
             f" -d {quoted_payload}"
         )
@@ -511,6 +554,7 @@ def real_smoke_stack_factory():
             backend_image=f"proxycache-real-smoke-backend:{suffix}",
             meta_volume=f"proxycache-real-smoke-meta-{suffix}",
             cache_volume=f"proxycache-real-smoke-cache-{suffix}",
+            model_port=_env_int("REAL_SMOKE_MODEL_PORT", 5800),
             backend_ctx_size=backend_ctx_size or _env_int("REAL_SMOKE_BACKEND_CTX_SIZE", 4096),
             backend_extra_args=backend_extra_args.strip(),
         )

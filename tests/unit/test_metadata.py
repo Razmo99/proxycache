@@ -18,10 +18,15 @@ def test_raw_prefix_joins_non_empty_content(cache_store: CacheStore) -> None:
             {"role": "system", "content": "  alpha  "},
             {"role": "user", "content": ""},
             {"role": "assistant", "content": ["not", "text"]},
-        ]
+        ],
+        tools=[{"type": "function", "function": {"name": "lookup"}}],
     )
 
-    assert prefix == "alpha\n\n['not', 'text']"
+    assert prefix == (
+        '[tools]\n[{"function":{"name":"lookup"},"type":"function"}]\n\n'
+        "[system]\nalpha\n\n"
+        '[assistant]\n["not","text"]'
+    )
 
 
 @pytest.mark.unit
@@ -37,7 +42,52 @@ def test_find_best_restore_candidate_skips_poisoned_entries(
 
     result = cache_store.find_best_restore_candidate(req_blocks, 2, 0.5, "model-a")
 
-    assert result == ("good-key", 1.0)
+    assert result is not None
+    assert result.key == "good-key"
+    assert result.match_ratio == 1.0
+
+
+@pytest.mark.unit
+def test_find_best_restore_candidate_requires_matching_system_and_tools_fingerprints(cache_store: CacheStore) -> None:
+    messages = [
+        {"role": "system", "content": "base rules"},
+        {"role": "user", "content": "one two three four"},
+    ]
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+    prefix = cache_store.raw_prefix(messages, tools=tools)
+    blocks = cache_store.block_hashes_from_text(prefix, 2)
+    cache_store.write_meta(
+        "fingerprinted-key",
+        prefix,
+        blocks,
+        2,
+        "model-a",
+        system_fingerprint=cache_store.system_fingerprint(messages),
+        tools_fingerprint=cache_store.tools_fingerprint(tools),
+    )
+
+    match = cache_store.find_best_restore_candidate(
+        blocks,
+        2,
+        0.5,
+        "model-a",
+        system_fingerprint=cache_store.system_fingerprint(messages),
+        tools_fingerprint=cache_store.tools_fingerprint(tools),
+    )
+    miss = cache_store.find_best_restore_candidate(
+        blocks,
+        2,
+        0.5,
+        "model-a",
+        system_fingerprint=cache_store.system_fingerprint(
+            [{"role": "system", "content": "mcp expanded rules"}]
+        ),
+        tools_fingerprint=cache_store.tools_fingerprint(tools),
+    )
+
+    assert match is not None
+    assert match.key == "fingerprinted-key"
+    assert miss is None
 
 
 @pytest.mark.unit

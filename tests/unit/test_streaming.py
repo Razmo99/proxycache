@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -33,11 +34,12 @@ class LifecycleStub:
     released: list[tuple[int, int]] = field(default_factory=list)
     saved: AsyncMock = field(default_factory=lambda: AsyncMock(return_value=True))
 
-    def maybe_poison_restore(self, *args: Any) -> None:
-        self.poisoned.append(args)
+    def assess_restore_quality(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+        self.poisoned.append((args, kwargs))
+        return SimpleNamespace(actual_ratio=0.2, degraded=False)
 
-    async def save_cache_artifacts(self, *args: Any) -> bool:
-        return await self.saved(*args)
+    async def save_cache_artifacts(self, *args: Any, **kwargs: Any) -> bool:
+        return await self.saved(*args, **kwargs)
 
     def release_slot(self, slot: tuple[int, int], span=None) -> None:
         self.released.append(slot)
@@ -76,7 +78,9 @@ async def test_start_stream_task_releases_slot_and_saves_cache(monkeypatch: pyte
     assert response.closed is True
     assert lifecycle.released == [(0, 1)]
     lifecycle.saved.assert_awaited_once()
-    assert lifecycle.poisoned[0][:3] == ("restore-key", True, "model-a")
+    poison_args, poison_kwargs = lifecycle.poisoned[0]
+    assert poison_args[:3] == ("restore-key", True, "model-a")
+    assert poison_kwargs["match_ratio"] is None
 
 
 @pytest.mark.unit

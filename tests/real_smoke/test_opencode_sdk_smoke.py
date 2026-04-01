@@ -53,6 +53,7 @@ def real_smoke_stack_factory():
             backend_image=f"proxycache-real-smoke-backend:{suffix}",
             meta_volume=f"proxycache-real-smoke-meta-{suffix}",
             cache_volume=f"proxycache-real-smoke-cache-{suffix}",
+            model_port=_LIVE_SMOKE._env_int("REAL_SMOKE_MODEL_PORT", 5800),
             backend_ctx_size=backend_ctx_size
             if backend_ctx_size is not None
             else _LIVE_SMOKE._env_int("REAL_SMOKE_BACKEND_CTX_SIZE", 4096),

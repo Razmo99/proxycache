@@ -14,6 +14,7 @@ from opentelemetry import trace
 
 from proxycache.observability.otel import (
     add_lifecycle_event,
+    add_restore_attributes,
     add_timing_attributes,
     set_error,
 )
@@ -41,8 +42,11 @@ class StreamingCoordinator:
         model_id: str,
         span=None,
         restore_key: str | None = None,
+        restore_match_ratio: float | None = None,
         restored: bool | None = None,
         persist_cache: bool = False,
+        system_fingerprint: str = "",
+        tools_fingerprint: str = "",
     ):
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
 
@@ -77,13 +81,20 @@ class StreamingCoordinator:
                 finally:
                     with suppress(Exception):
                         await response.aclose()
-                    self.lifecycle.maybe_poison_restore(
+                    restore_assessment = self.lifecycle.assess_restore_quality(
                         restore_key,
                         restored,
                         model_id,
                         last_timings,
-                        span,
+                        match_ratio=restore_match_ratio,
+                        span=span,
                     )
+                    if restore_assessment is not None:
+                        add_restore_attributes(
+                            span,
+                            actual_ratio=restore_assessment.actual_ratio,
+                            degraded=restore_assessment.degraded,
+                        )
                     if persist_cache:
                         saved = await self.lifecycle.save_cache_artifacts(
                             slot,
@@ -91,7 +102,9 @@ class StreamingCoordinator:
                             prefix,
                             blocks,
                             model_id,
-                            span,
+                            system_fingerprint=system_fingerprint,
+                            tools_fingerprint=tools_fingerprint,
+                            span=span,
                         )
                     else:
                         add_lifecycle_event(

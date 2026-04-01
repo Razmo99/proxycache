@@ -170,6 +170,15 @@ def test_add_input_response_timing_and_error_attributes(monkeypatch: pytest.Monk
         },
     )
     otel.add_cache_attributes(span, True, slot_id=3, n_used=2)
+    otel.add_restore_attributes(
+        span,
+        match_ratio=0.92,
+        lcp_blocks=12,
+        request_block_count=13,
+        candidate_block_count=13,
+        actual_ratio=0.48,
+        degraded=True,
+    )
     otel.add_llm_attributes(span, "model-a", response_model="model-b")
     otel.add_response_attributes(
         span,
@@ -197,6 +206,12 @@ def test_add_input_response_timing_and_error_attributes(monkeypatch: pytest.Monk
     assert span.attributes["proxycache.cache.hit"] is True
     assert span.attributes["proxycache.slot.id"] == 3
     assert span.attributes["proxycache.slot.in_use_count"] == 2
+    assert span.attributes["proxycache.cache.restore.match_ratio"] == 0.92
+    assert span.attributes["proxycache.cache.restore.lcp_blocks"] == 12
+    assert span.attributes["proxycache.cache.restore.request_block_count"] == 13
+    assert span.attributes["proxycache.cache.restore.candidate_block_count"] == 13
+    assert span.attributes["proxycache.cache.restore.actual_read_ratio"] == 0.48
+    assert span.attributes["proxycache.cache.restore.degraded"] is True
     assert span.attributes[GEN_AI_REQUEST_MODEL] == "model-a"
     assert span.attributes[GEN_AI_RESPONSE_MODEL] == "model-b"
     assert span.name == "chat model-a"

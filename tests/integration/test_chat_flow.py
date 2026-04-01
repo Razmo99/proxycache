@@ -48,6 +48,59 @@ async def test_big_json_request_restores_and_records_metadata(async_test_client,
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_big_json_request_skips_restore_when_system_or_tools_fingerprint_changes(
+    async_test_client,
+    mock_backend,
+) -> None:
+    service = async_test_client.proxycache_app.state.service
+    base_messages = [
+        {"role": "system", "content": "base repo rules"},
+        {"role": "user", "content": "one two three four five six"},
+    ]
+    base_tools = [{"type": "function", "function": {"name": "lookup_repo"}}]
+    prefix = service.cache_store.raw_prefix(base_messages, tools=base_tools)
+    blocks = service.cache_store.block_hashes_from_text(prefix, service.settings.words_per_block)
+    service.cache_store.write_meta(
+        "restore-key",
+        prefix,
+        blocks,
+        service.settings.words_per_block,
+        "llama.cpp",
+        system_fingerprint=service.cache_store.system_fingerprint(base_messages),
+        tools_fingerprint=service.cache_store.tools_fingerprint(base_tools),
+    )
+
+    changed_system_messages = [
+        {"role": "system", "content": "base repo rules plus MCP guidance"},
+        {"role": "user", "content": "one two three four five six"},
+    ]
+    response = await async_test_client.post(
+        "/v1/chat/completions",
+        json={"model": "llama.cpp", "messages": changed_system_messages, "tools": base_tools, "stream": False},
+    )
+
+    assert response.status_code == 200
+    restore_requests = [
+        request for request in mock_backend.requests if request.url.path == "/slots/0" and request.url.params.get("action") == "restore"
+    ]
+    assert restore_requests == []
+
+    mock_backend.requests.clear()
+    changed_tools = [{"type": "function", "function": {"name": "lookup_repo_mcp"}}]
+    response = await async_test_client.post(
+        "/v1/chat/completions",
+        json={"model": "llama.cpp", "messages": base_messages, "tools": changed_tools, "stream": False},
+    )
+
+    assert response.status_code == 200
+    restore_requests = [
+        request for request in mock_backend.requests if request.url.path == "/slots/0" and request.url.params.get("action") == "restore"
+    ]
+    assert restore_requests == []
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_multimodal_request_bypasses_slot_management(async_test_client, mock_backend, messages_factory) -> None:
     mock_backend.model_id = "qwen3-vl-30b"
 

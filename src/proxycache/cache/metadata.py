@@ -17,6 +17,18 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 POISON_SUFFIX = ".poison.json"
+LOW_CACHE_REUSE_RATIO_THRESHOLD = 0.5
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreCandidate:
+    """Candidate metadata for a restore decision."""
+
+    key: str
+    match_ratio: float
+    lcp_blocks: int
+    request_block_count: int
+    candidate_block_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +40,8 @@ class CacheMetadata:
     prefix_len: int
     wpb: int
     blocks: list[str]
+    system_fingerprint: str
+    tools_fingerprint: str
     timestamp: float
 
     @classmethod
@@ -38,6 +52,8 @@ class CacheMetadata:
             prefix_len=int(payload["prefix_len"]),
             wpb=int(payload["wpb"]),
             blocks=[str(block) for block in payload.get("blocks", [])],
+            system_fingerprint=str(payload.get("system_fingerprint") or ""),
+            tools_fingerprint=str(payload.get("tools_fingerprint") or ""),
             timestamp=float(payload.get("timestamp", 0.0)),
         )
 
@@ -57,16 +73,71 @@ class CacheStore:
         self.words_per_block = words_per_block
         self.max_saved_caches = max_saved_caches
 
-    def raw_prefix(self, messages: list[dict[str, Any]]) -> str:
+    def raw_prefix(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str:
         parts: list[str] = []
+        rendered_tools = self.render_tools(tools)
+        if rendered_tools:
+            parts.append(f"[tools]\n{rendered_tools}")
         for message in messages or []:
-            content = message.get("content", "")
-            rendered = content.strip() if isinstance(content, str) else str(content).strip()
+            rendered = self.render_message(message)
             if rendered:
                 parts.append(rendered)
         text = "\n\n".join(parts).strip()
         log.debug("raw_prefix len_chars=%d", len(text))
         return text
+
+    @staticmethod
+    def _stable_json(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+    def render_tools(self, tools: list[dict[str, Any]] | None) -> str:
+        if not isinstance(tools, list) or not tools:
+            return ""
+        return self._stable_json(tools)
+
+    def render_message(self, message: dict[str, Any]) -> str:
+        if not isinstance(message, dict):
+            return ""
+        role = str(message.get("role") or "user").strip() or "user"
+        content = message.get("content", "")
+        rendered_parts: list[str] = []
+        if isinstance(content, str):
+            stripped = content.strip()
+            if stripped:
+                rendered_parts.append(stripped)
+        elif content is not None:
+            rendered_parts.append(self._stable_json(content))
+
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            rendered_parts.append(f"tool_calls={self._stable_json(tool_calls)}")
+
+        if not rendered_parts:
+            return ""
+        return f"[{role}]\n" + "\n".join(rendered_parts)
+
+    @staticmethod
+    def _fingerprint(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest() if text else ""
+
+    def system_fingerprint(self, messages: list[dict[str, Any]]) -> str:
+        rendered = "\n\n".join(
+            rendered
+            for rendered in (
+                self.render_message(message)
+                for message in messages or []
+                if isinstance(message, dict) and str(message.get("role") or "user") == "system"
+            )
+            if rendered
+        ).strip()
+        return self._fingerprint(rendered)
+
+    def tools_fingerprint(self, tools: list[dict[str, Any]] | None) -> str:
+        return self._fingerprint(self.render_tools(tools))
 
     @staticmethod
     def words_from_text(text: str) -> list[str]:
@@ -116,24 +187,44 @@ class CacheStore:
         wpb: int,
         threshold: float,
         model_id: str,
-    ) -> tuple[str, float] | None:
-        best_key: str | None = None
-        best_ratio = 0.0
+        *,
+        system_fingerprint: str = "",
+        tools_fingerprint: str = "",
+    ) -> RestoreCandidate | None:
+        best_candidate: RestoreCandidate | None = None
 
         for meta in self.scan_all_meta():
             if meta.model_id != model_id or meta.wpb != wpb:
                 continue
             if self.is_restore_poisoned(meta.key):
                 continue
+            if meta.system_fingerprint != system_fingerprint:
+                continue
+            if tools_fingerprint != meta.tools_fingerprint:
+                continue
 
             lcp = self.lcp_blocks(req_blocks, meta.blocks)
-            denom = max(1, min(len(req_blocks), len(meta.blocks)))
+            denom = max(1, len(req_blocks))
             ratio = lcp / denom
-            if ratio >= threshold and ratio > best_ratio:
-                best_ratio = ratio
-                best_key = meta.key
+            candidate = RestoreCandidate(
+                key=meta.key,
+                match_ratio=ratio,
+                lcp_blocks=lcp,
+                request_block_count=len(req_blocks),
+                candidate_block_count=len(meta.blocks),
+            )
+            if ratio < threshold:
+                continue
+            if best_candidate is None:
+                best_candidate = candidate
+                continue
+            if candidate.match_ratio > best_candidate.match_ratio:
+                best_candidate = candidate
+                continue
+            if candidate.match_ratio == best_candidate.match_ratio and candidate.lcp_blocks > best_candidate.lcp_blocks:
+                best_candidate = candidate
 
-        return (best_key, best_ratio) if best_key else None
+        return best_candidate
 
     def write_meta(
         self,
@@ -142,6 +233,8 @@ class CacheStore:
         blocks: list[str],
         wpb: int,
         model_id: str,
+        system_fingerprint: str = "",
+        tools_fingerprint: str = "",
     ) -> None:
         payload = CacheMetadata(
             key=key,
@@ -149,6 +242,8 @@ class CacheStore:
             prefix_len=len(prefix_text),
             wpb=wpb,
             blocks=blocks,
+            system_fingerprint=system_fingerprint,
+            tools_fingerprint=tools_fingerprint,
             timestamp=time.time(),
         )
         with self._meta_path(key).open("w", encoding="utf-8") as handle:
@@ -280,7 +375,10 @@ class CacheStore:
 
         prompt_n = int(payload.get("prompt_n") or 0)
         cache_n = int(payload.get("cache_n") or 0)
+        reason = str(payload.get("reason") or "")
         if prompt_n > 0 and cache_n == 0:
+            return True
+        if reason == "low_cache_reuse_after_restore":
             return True
 
         self._delete_poison_file(key, "inactive")

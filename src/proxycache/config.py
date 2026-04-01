@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+log = logging.getLogger(__name__)
+
+
 def configure_logging(level: str) -> None:
     """Configure process-wide logging once."""
     logging.basicConfig(
@@ -76,8 +79,12 @@ class Settings:
 
     def ensure_directories(self) -> None:
         """Create required directories."""
-        self.meta_dir.mkdir(parents=True, exist_ok=True)
-        self.slot_save_path.mkdir(parents=True, exist_ok=True)
+        for dir_path in (self.meta_dir, self.slot_save_path):
+            if not dir_path.exists():
+                dir_path.mkdir(parents=True, exist_ok=True)
+                log.info("created_directory path=%s", dir_path)
+            else:
+                log.debug("directory_exists path=%s", dir_path)
 
 
 def _env_int(name: str, default: int) -> int:

@@ -39,19 +39,44 @@ async def test_save_cache_artifacts_returns_false_when_save_raises(make_settings
 
 
 @pytest.mark.unit
-def test_maybe_poison_restore_only_marks_failed_cache_reuse(make_settings, cache_store) -> None:
+def test_assess_restore_quality_marks_failed_cache_reuse(make_settings, cache_store) -> None:
     settings = make_settings(name="poison")
     slot_manager = SimpleNamespace(save_after=None, release=lambda slot: None)
     lifecycle = CacheLifecycleManager(settings, slot_manager, cache_store)
     cache_store.write_meta("cache-key", "prefix", ["a"], 2, "model-a")
 
-    lifecycle.maybe_poison_restore(
+    assessment = lifecycle.assess_restore_quality(
         "cache-key",
         True,
         "model-a",
         {"prompt_n": 20, "cache_n": 0, "prompt_ms": 55.0},
+        match_ratio=1.0,
     )
 
+    assert assessment is not None
+    assert assessment.degraded is True
+    assert assessment.actual_ratio == 0.0
+    assert cache_store.is_restore_poisoned("cache-key") is True
+
+
+@pytest.mark.unit
+def test_assess_restore_quality_marks_large_prediction_gap_as_degraded(make_settings, cache_store) -> None:
+    settings = make_settings(name="poison-gap")
+    slot_manager = SimpleNamespace(save_after=None, release=lambda slot: None)
+    lifecycle = CacheLifecycleManager(settings, slot_manager, cache_store)
+    cache_store.write_meta("cache-key", "prefix", ["a"], 2, "model-a")
+
+    assessment = lifecycle.assess_restore_quality(
+        "cache-key",
+        True,
+        "model-a",
+        {"prompt_n": 100, "cache_n": 40, "prompt_ms": 55.0},
+        match_ratio=0.9,
+    )
+
+    assert assessment is not None
+    assert assessment.degraded is True
+    assert assessment.poison_reason == "low_cache_reuse_after_restore"
     assert cache_store.is_restore_poisoned("cache-key") is True
 
 
@@ -65,4 +90,3 @@ def test_release_slot_delegates_to_slot_manager(make_settings, cache_store) -> N
     lifecycle.release_slot((0, 1))
 
     assert released == [(0, 1)]
-

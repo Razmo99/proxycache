@@ -12,7 +12,16 @@ exec /app/llama-server \
   --host 0.0.0.0 \
   --port "$port" \
   --model "$model_path" \
-  --ctx-size "$ctx_size" \
+  -ngl 999 \
+  -fa 1 \
+  --no-mmap \
+  --mlock \
+  --jinja \
+  --cache-ram -1 \
   --parallel "$parallel" \
   --slot-save-path /cache \
+  --swa-full \
+  --metrics \
+  --no-warmup \
+  --ctx-size "$ctx_size" \
   $extra_args
