@@ -8,7 +8,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from proxycache.cache.metadata import CacheStore, LOW_CACHE_REUSE_RATIO_THRESHOLD
+from proxycache.cache.metadata import LOW_CACHE_REUSE_RATIO_THRESHOLD, CacheStore
 from proxycache.config import Settings
 from proxycache.observability.otel import add_lifecycle_event, set_error
 from proxycache.services.slots import GSlot, SlotManager
